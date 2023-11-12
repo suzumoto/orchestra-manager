@@ -6,6 +6,8 @@ from sheet import Sheet
 from draw import PlayerBoxDrawer
 from PIL import Image, ImageDraw, ImageFont
 
+your_bot_token = "your bot token here"
+
 intents = discord.Intents.all()
 bot = commands.Bot(command_prefix='$', intents=intents)
 
@@ -172,4 +174,4 @@ async def on_command_completion(ctx):
     if ctx.channel.name == "出欠管理システム": # 特定channelのみで動作
         await ctx.message.add_reaction('✅')
     
-bot.run('MTE2OTExNDY0NDU4NjE4MDYyOA.GpUPgM.770e64Hgtow7Qg4FydmrmzeofVwjnOD0Ko0HAk')
+bot.run(your_bot_token)
