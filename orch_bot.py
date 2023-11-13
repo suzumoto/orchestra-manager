@@ -57,11 +57,10 @@ async def on_raw_reaction_add(payLoad):
 
     if output_emoji_flag and calender_channel_flag:
         unnei_role = discord.utils.get(guild.roles, name="運営")
+        message = await channel.fetch_message(payLoad.message_id)
+        reactions = message.reactions
         
         if unnei_role in push_member.roles: # 押した人が運営ロール
-            message = await channel.fetch_message(payLoad.message_id)
-            reactions = message.reactions
-
             shusseki_emoji = discord.utils.get(bot.emojis, name="shusseki")
             shusseki_reaction = discord.utils.get(reactions, emoji=shusseki_emoji)
             if shusseki_reaction == None:
@@ -107,6 +106,11 @@ async def on_raw_reaction_add(payLoad):
                 with open(program + ".png", 'rb') as f:
                     d_file = discord.File(f, description=program)
                     await output_channel.send(file=d_file)
+                    
+        else: # 押した人が運営ロールでない場合
+            shutsuryoku_reaction = discord.utils.get(message.reactions, emoji=output_emoji)
+            await shutsuryoku_reaction.remove(member) # リアクションを削除
+            await channel.send("出力は運営専用です", ephemeral=True) # ユーザーのみに見えるメッセージ
 
 @bot.command()
 async def show_pultlist(ctx):
