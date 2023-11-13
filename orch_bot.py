@@ -110,7 +110,6 @@ async def on_raw_reaction_add(payLoad):
         else: # 押した人が運営ロールでない場合
             shutsuryoku_reaction = discord.utils.get(message.reactions, emoji=output_emoji)
             await shutsuryoku_reaction.remove(member) # リアクションを削除
-            await channel.send("出力は運営専用です", ephemeral=True) # ユーザーのみに見えるメッセージ
 
 @bot.command()
 async def show_pultlist(ctx):
