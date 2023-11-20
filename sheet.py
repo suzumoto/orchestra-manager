@@ -1,18 +1,36 @@
 import csv
 import discord
 from discord.ext import commands
+import configparser
 
 class Sheet:
-    """乗り番管理クラス"""
-    PART_LIST = ("Vn1st", "Vn2nd", "Va", "Vc", "Cb", "Fl", "Ob", "Cl", "Fg", "Hr", "Tp", "Tb", "Tuba", "Perc")
-    PROGRAM_LIST = ("前", "中", "メイン")
-    FILENAME_LIST = [program + "_sheet.csv" for program in PROGRAM_LIST]
+    """
+    乗り番管理クラス
+    
+    Attributes
+    ----------
+    program : str
+        どのプログラムに対するSheetかを特定するキー
+    
+    filename : str 
+        このクラスのデータと対応するcsvファイルのファイル名
+    
+    sheet_dict : dict of {Discord ID: (str, int, str)}
+        メンバーのDiscord ID をキー, (part, pult, nick) を値とするdict
+        part は "Vn1st", "Ob" などの楽器名, pult は楽器内のindexを表す数値, nick はdiscordの表示名
 
+    already_added_pult_list : list of (str, int)
+        既に sheet_dict に追加されている (part, pult) のリスト
+
+    PART_LIST : list of str
+        part (str) のリスト
+    """
+
+    PART_LIST = ("Vn1st", "Vn2nd", "Va", "Vc", "Cb", "Fl", "Ob", "Cl", "Fg", "Hr", "Tp", "Tb", "Tuba", "Perc")
+    
     def __init__(self, program):
-        if(program not in self.PROGRAM_LIST):
-            raise ValueError('Sheet.__init__ error: program が見つかりません')
         self.program = program
-        self.filename = self.FILENAME_LIST[self.PROGRAM_LIST.index(program)]
+        self.filename = program + "_sheet.csv"
         self.sheet_dict = {}
         self.already_added_pult_list = []
 

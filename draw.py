@@ -2,14 +2,25 @@ from PIL import Image, ImageDraw, ImageFont
 from sheet import Sheet
 
 class PlayerBoxDrawer:
-    """乗り番描画用クラス"""
-    BLACK = (0,0,0)
-    WHITE = (255,255,255)
-    GREEN = (196, 244, 201)
-    GRAY  = (220,220,220)
-    YELLOW=(238,246,150)
-    BLUE=(163,230,242)
-    RED=(255,0,0)
+    """
+    乗り番描画用クラス
+    
+    Attributes
+    ----------
+    position_list : dict of {str: [int, int]}
+        各楽器の奏者ボックス左上の座標を格納したlistのdict
+    img : Image
+        PIL.Image のオブジェクト 描画用
+    draw : ImageDraw
+        PIL.ImageDrawのオブジェクト 描画ツールセット
+    """
+    BLACK  = (  0,  0,  0)
+    WHITE  = (255,255,255)
+    GREEN  = (196,244,201)
+    GRAY   = (220,220,220)
+    YELLOW = (238,246,150)
+    BLUE   = (163,230,242)
+    RED    = (255,  0,  0)
     NAME_FONT = ImageFont.truetype('GenShinGothic-Medium.ttf', 24)
     PART_FONT = ImageFont.truetype('GenShinGothic-Medium.ttf', 20)
     POS_TYPE_LIST = ("対向配置")
