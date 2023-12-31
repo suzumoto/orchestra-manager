@@ -3,6 +3,8 @@
 - 他サービスを使うことなく、Discord内で完結したシステムです。便利!
 - 団員は 出席/欠席/早退/遅刻 のリアクションをするだけ。出力も簡単です.
 
+# 導入と使い方
+- 導入方法と使い方は [wiki](https://github.com/suzumoto/orchestra-manager/wiki/%E5%B0%8E%E5%85%A5%E6%96%B9%E6%B3%95%E3%81%A8%E4%BD%BF%E3%81%84%E6%96%B9) を参照してください。
 
 # ライセンス
 - MIT Licenseです。LICENSE.txtも参照
