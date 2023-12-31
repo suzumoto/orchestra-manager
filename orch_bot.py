@@ -9,7 +9,7 @@ config = configparser.ConfigParser()
 config.read('settings.ini')
 
 your_bot_token = config['TOKEN']['bot_token']
-print(your_bot_token)
+
 intents = discord.Intents.all()
 bot = commands.Bot(command_prefix='$', intents=intents)
 
@@ -28,6 +28,7 @@ kesseki_name  = config["EMOJI"]["kesseki"]
 chikoku_name  = config["EMOJI"]["chikoku"]
 soutai_name   = config["EMOJI"]["soutai"]
 output_name   = config["EMOJI"]["output"]
+dm_name       = config["EMOJI"]["dm"]
 
 @bot.event
 async def on_ready():
@@ -37,28 +38,33 @@ async def on_ready():
 
 @bot.event
 async def on_message(message):
-    channel = message.channel
-    guild = message.guild
-
-    # カレンダーチャネルへの対応
-    rsvp_channels = [discord.utils.get(guild.channels, name=rsvp_channel_name)
-                     for rsvp_channel_name in rsvp_channel_name_list]
+    if isinstance(message.channel, discord.DMChannel): # DMだったら何もしない
+        pass # DM ではコマンドも動作しない
+    else:
+        channel = message.channel
+        guild = message.guild
     
-    if channel in rsvp_channels:
-        shusseki_emoji = discord.utils.get(bot.emojis, name=shusseki_name)
-        kesseki_emoji = discord.utils.get(bot.emojis, name=kesseki_name)
-        chikoku_emoji = discord.utils.get(bot.emojis, name=chikoku_name)
-        soutai_emoji = discord.utils.get(bot.emojis, name=soutai_name)
-        await message.add_reaction(shusseki_emoji)
-        await message.add_reaction(kesseki_emoji)
-        await message.add_reaction(chikoku_emoji)
-        await message.add_reaction(soutai_emoji)
+        # カレンダーチャネルへの対応
+        rsvp_channels = [discord.utils.get(guild.channels, name=rsvp_channel_name)
+                         for rsvp_channel_name in rsvp_channel_name_list]
+    
+        if channel in rsvp_channels:
+            shusseki_emoji = discord.utils.get(bot.emojis, name=shusseki_name)
+            kesseki_emoji = discord.utils.get(bot.emojis, name=kesseki_name)
+            chikoku_emoji = discord.utils.get(bot.emojis, name=chikoku_name)
+            soutai_emoji = discord.utils.get(bot.emojis, name=soutai_name)
+            await message.add_reaction(shusseki_emoji)
+            await message.add_reaction(kesseki_emoji)
+            await message.add_reaction(chikoku_emoji)
+            await message.add_reaction(soutai_emoji)
         
-    await bot.process_commands(message) # 重要! これが無いと @bot.command()が動作しなくなる
+        await bot.process_commands(message) # 重要! これが無いと @bot.command()が動作しなくなる
     
 @bot.event
 async def on_raw_reaction_add(payLoad):
     guild = discord.utils.get(bot.guilds, id=payLoad.guild_id)
+    if guild is None: # DM ならなにもしない
+        return
     channel = discord.utils.get(guild.channels, id=payLoad.channel_id)
     push_member = payLoad.member
     pushed_emoji = payLoad.emoji
@@ -69,11 +75,14 @@ async def on_raw_reaction_add(payLoad):
     
     output_emoji = discord.utils.get(bot.emojis, name=output_name)
     output_channel = discord.utils.get(guild.channels, name=output_channel_name)
-    
+
+    dm_emoji_flag = (pushed_emoji.name == dm_name) # DMの絵文字が押された
     output_emoji_flag = (output_emoji == pushed_emoji) # 出力の絵文字が押された
     rsvp_channel_flag = (channel in rsvp_channel_list) # RSVPチャンネルで押された
 
-    if output_emoji_flag and rsvp_channel_flag:
+    output_flag = (dm_emoji_flag or output_emoji_flag)
+    
+    if output_flag and rsvp_channel_flag: # output
         output_role_list = [discord.utils.get(guild.roles, name=output_role_name)
                             for output_role_name in output_role_name_list]
         message = await channel.fetch_message(payLoad.message_id)
@@ -127,8 +136,10 @@ async def on_raw_reaction_add(payLoad):
                 boxdrawer.save(program + ".png")
                 with open(program + ".png", 'rb') as f:
                     d_file = discord.File(f, description=program)
-                    await output_channel.send(file=d_file)
-                    
+                    if output_emoji_flag:
+                        await output_channel.send(file=d_file)
+                    elif dm_emoji_flag:
+                        await push_member.send(file=d_file)
         else: # 押した人が運営ロールでない場合
             shutsuryoku_reaction = discord.utils.get(message.reactions, emoji=output_emoji)
             await shutsuryoku_reaction.remove(push_member) # リアクションを削除
