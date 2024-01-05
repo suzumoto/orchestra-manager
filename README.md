@@ -5,7 +5,7 @@
 
 # 導入と使い方
 - 導入方法と使い方は [wiki](https://github.com/suzumoto/orchestra-manager/wiki/%E5%B0%8E%E5%85%A5%E6%96%B9%E6%B3%95%E3%81%A8%E4%BD%BF%E3%81%84%E6%96%B9) を参照してください。
-
+- [Discordサーバー](https://discord.gg/mewaFyttak) もあります。
 # ライセンス
 - MIT Licenseです。LICENSE.txtも参照
 
