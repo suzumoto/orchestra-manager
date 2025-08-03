@@ -1,6 +1,10 @@
 __pycache__/
-
+*~
 *csv
 
 *png
 !logo.png
+
+credentials.json
+.seat_layout_cache
+.venv

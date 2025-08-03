@@ -1,87 +1,467 @@
-import csv
-import discord
-from discord.ext import commands
-import configparser
+# sheet.py
+from __future__ import annotations
 
-class Sheet:
-    """
-    乗り番管理クラス
-    
-    Attributes
-    ----------
-    program : str
-        どのプログラムに対するSheetかを特定するキー
-    
-    filename : str 
-        このクラスのデータと対応するcsvファイルのファイル名
-    
-    sheet_dict : dict of {Discord ID: (str, int, str)}
-        メンバーのDiscord ID をキー, (part, pult, nick) を値とするdict
-        part は "Vn1st", "Ob" などの楽器名, pult は楽器内のindexを表す数値, nick はdiscordの表示名
+import asyncio
+import threading
+from typing import Dict, Tuple, List
+import re
 
-    already_added_pult_list : list of (str, int)
-        既に sheet_dict に追加されている (part, pult) のリスト
+import gspread
+from google.oauth2.service_account import Credentials
 
-    PART_LIST : list of str
-        part (str) のリスト
-    """
+_STATUS_PREFIXES = ("出席", "欠席", "遅刻", "早退")
+_TOKEN_RE = re.compile(
+    r"(出席|欠席|遅刻(?:\([^)]*\))?|早退(?:\([^)]*\))?)"
+)
 
-    PART_LIST = ("Vn1st", "Vn2nd", "Va", "Vc", "Cb", "Fl", "Ob", "Cl", "Fg", "Hr", "Tp", "Tb", "Tuba", "Perc")
-    
-    def __init__(self, program):
+def _base_status(cell: str) -> str:
+    """セル値から先頭の基本ステータスを取り出す"""
+    for p in _STATUS_PREFIXES:
+        if cell.startswith(p):
+            return p
+    return "未回答"
+
+
+class CellOccupiedError(Exception):
+    """Spread Sheetへの書き込み時に、上書きが必要な時に送出"""
+    def __init__(
+        self,
+        row: int,
+        program: str,
+        prev_part: str,
+        prev_num: str,
+        new_part: str,
+        new_num: int,
+    ) -> None:
+        self.row = row
         self.program = program
-        self.filename = program + "_sheet.csv"
-        self.sheet_dict = {}
-        self.already_added_pult_list = []
+        self.prev_part = prev_part
+        self.prev_num = prev_num
+        self.new_part = new_part
+        self.new_num = new_num
+        super().__init__(
+            f"row:{row} {program}({prev_part}-{prev_num}) → "
+            f"{new_part}-{new_num}"
+        )
 
-    def append(self, part, pult: int, member: discord.Member):
-        if(part not in self.PART_LIST):
-            raise ValueError('Sheet.append Error: partが見つかりません')
-        if (part, pult) in self.already_added_pult_list:
-            raise ValueError(f'Sheet.append Error: (part, pult) = ({part}, {pult}) は既に存在します')
-        if member.id in self.sheet_dict:
-            raise ValueError(f'Sheet.append Error: {member} は既に存在します')
-        if member.nick is not None:
-            self.sheet_dict[member.id] = (part, pult, member.nick)
+
+_EMOJI_TO_STATUS = {
+    "shusseki": "出席",
+    "kesseki": "欠席",
+    "chikoku": "遅刻",
+    "soutai": "早退",
+}
+
+# 1 行目 … ヘッダ（Part / Num / … / <日付> / <日付> / …）
+# 2 行目 … メッセージ ID を格納
+_HEADER_DATE_ROW = 1
+_MESSAGE_ID_ROW = 2
+_DATA_START_ROW = 3
+
+
+# -------------------------------------------------------------
+# 動的ヘッダビルド：プログラムごとに「_パート / _席次」を並べる
+# -------------------------------------------------------------
+def _default_headers(programs: List[str]) -> List[str]:
+    heads = ["discord表示名", "氏名", "Discord ID"]
+    for prog in programs:
+        heads.extend([f"{prog}_パート", f"{prog}_席次"])
+    return heads
+
+
+class GoogleSheetsManager:
+    """Google Spread Sheet ラッパー（同期 I/O）
+    行＝奏者、列＝練習日
+    """
+
+    def __init__(
+        self,
+        spreadsheet_id: str,
+        worksheet_name: str,
+        credential_json: str = "credentials.json",
+        programs: List[str] | None = None,
+    ) -> None:
+        scopes = [
+            "https://www.googleapis.com/auth/spreadsheets",
+            "https://www.googleapis.com/auth/drive.readonly",
+        ]
+        creds = Credentials.from_service_account_file(credential_json,
+                                                      scopes=scopes)
+        client = gspread.authorize(creds)
+
+        self.sh = client.open_by_key(spreadsheet_id)
+        self.ws = self.sh.worksheet(worksheet_name)
+        self.programs: List[str] = programs or []
+
+        self._lock = threading.Lock()
+
+        # 空Sheetならヘッダ・メッセージ行を用意
+        self._ensure_headers()
+        self._build_index()
+
+    def _refresh_index(self) -> None:
+        """外部で行／列が動いた可能性を考慮し、毎回 index を再構築"""
+        self._build_index()
+
+    # ------------------------------------------------------------------
+    # public
+    # ------------------------------------------------------------------
+
+    # ----------------------------------------------------------
+    # 列追加：練習日（ヘッダ=日付, 2 行目=message_id）
+    # ----------------------------------------------------------
+    def add_event_column(self, header_str: str, message_id: int) -> int:
+        """
+        新しい練習日列を一番右に追加し、ヘッダとメッセージ ID を記入
+        既に message_id が登録済みなら既存列を返すだけ
+        Returns
+        -------
+        col : int
+            1-index の列番号
+        """
+        with self._lock:
+            self._refresh_index()
+            # 既存チェック
+            if message_id in self._msgid_to_col:
+                return self._msgid_to_col[message_id]
+
+            # 右端の次列へ書き込み
+            new_col = len(self._col_to_header) + 1
+            self.ws.update_cell(_HEADER_DATE_ROW, new_col, header_str)
+            self.ws.update_cell(_MESSAGE_ID_ROW, new_col, str(message_id))
+
+            # インデックスを更新
+            self._build_index()
+            return new_col
+
+    def update_status(  # noqa: C901, PLR0915
+        self,
+        message_id: int,
+        member_id: int,
+        status_name: str,
+    ) -> None:
+        """
+        期待仕様
+        --------
+        1. 出席／欠席が来たらそれ 1 個だけをセルに残す。
+        2. 遅刻／早退は同時に 1 個ずつまで残す。
+           - 同じ種類を押し直したら置き換え
+           - 片方だけ来た場合は既存のもう一方を温存
+        """
+
+        def _tokenize(text: str) -> Dict[str, str]:
+            """
+            セル文字列を基本 4 ステータス単位で分解。
+            戻り値キーは『出席』『欠席』『遅刻』『早退』
+            値は元文字列（括弧付きの場合も含む）。
+            """
+            mapping: Dict[str, str] = {}
+            for tok in _TOKEN_RE.findall(text):
+                if tok.startswith("遅刻"):
+                    mapping["遅刻"] = tok.strip()
+                elif tok.startswith("早退"):
+                    mapping["早退"] = tok.strip()
+                else:
+                    mapping[tok] = tok.strip()
+            return mapping
+
+        # -------- 行・列の特定 --------------------------------
+        self._refresh_index()  # ← 前回答の Lock 対応が入っている想定
+        col = self._msgid_to_col[message_id]
+        row = self._member_to_row[member_id]
+
+        current_raw = self.ws.cell(row, col).value or ""
+        cur_map = _tokenize(current_raw)
+
+        # -------- 新ステータスを反映 ----------------------------
+        base = (
+            "遅刻" if status_name.startswith("遅刻") else
+            "早退" if status_name.startswith("早退") else
+            status_name  # 出席 or 欠席
+        )
+
+        if base in {"出席", "欠席"}:
+            # 1. 出席／欠席は単独で確定
+            new_val = base
         else:
-            self.sheet_dict[member.id] = (part, pult, member.global_name)
-        self.already_added_pult_list.append((part, pult))
-        
-    def load_csv(self):
-        with open(self.filename) as sheet:
-            reader = csv.reader(sheet)
-            for row in reader:
-                if(row[0] not in self.PART_LIST):
+            # 2. 遅刻／早退は共存可
+            cur_map[base] = status_name.strip()  # 置き換え or 挿入
+            # 片方だけ残っているかもしれないので順序を固定化
+            parts = []
+            if "遅刻" in cur_map:
+                parts.append(cur_map["遅刻"])
+            if "早退" in cur_map:
+                parts.append(cur_map["早退"])
+            new_val = " ".join(parts).strip()
+
+        # -------- シートへ書き込み ------------------------------
+        self.ws.update_cell(row, col, new_val)
+
+    # ----------------------------------------------------------
+    # draw.py 用：1 日の出欠を dict で取得
+    # ----------------------------------------------------------
+    def attendance_dict(  # noqa: C901
+        self,
+        message_id: int,
+        program: str,
+    ) -> Dict[Tuple[str, int, str], str]:
+        """
+        {(part, num, name): status_raw}
+        num がシートに無い場合は 0
+        """
+        with self._lock:
+            self._refresh_index()
+            if message_id not in self._msgid_to_col:
+                raise KeyError(f"message_id {message_id} が列に登録されていません")
+
+            col = self._msgid_to_col[message_id]
+
+            # ---------- ヘッダ行をユニーク化 ---------- #
+            raw_header = self.ws.row_values(_HEADER_DATE_ROW)
+            expected_headers: list[str] = []
+            for idx, cell in enumerate(raw_header, start=1):
+                if str(cell).strip():
+                    expected_headers.append(str(cell).strip())
+                else:
+                    expected_headers.append(f"__col{idx}")
+
+            records = self.ws.get_all_records(
+                head=_HEADER_DATE_ROW,
+                expected_headers=expected_headers,
+            )
+
+            att: Dict[Tuple[str, int, str], str] = {}
+            header_key = self._col_to_header[col]
+
+            for rec in records:
+                # ---- パート・席次・氏名 ---------------------------
+                part = str(rec.get(f"{program}_パート", "")).strip()
+                try:
+                    num = int(rec.get(f"{program}_席次", 0) or 0)
+                except (ValueError, TypeError):
+                    num = 0
+                name = (
+                    str(rec.get("discord表示名") or "").strip()
+                    or str(rec.get("氏名") or "").strip()
+                    or "???"
+                )
+
+                # ---- ステータス文字列 -----------------------------
+                status_raw = str(rec.get(header_key, "")).strip()
+                att[(part, num, name)] = status_raw if status_raw else "未回答"
+
+            return att
+
+    # ------------------------------------------------------
+    # 複数行をまとめて追加
+    # ------------------------------------------------------
+    def append_rows_bulk(self, rows: List[List[str]]) -> None:
+        if not rows:
+            return
+        with self._lock:
+            self._refresh_index()
+            start_row = self._next_data_row()
+            self.ws.insert_rows(rows, row=start_row)
+            self._build_index()
+
+    # ------------------------------------------------------------------
+    # private
+    # ------------------------------------------------------------------
+    # --------------------------------------------------
+    # 内部ユーティリティ：次に挿入すべき行を返す
+    # --------------------------------------------------
+    def _next_data_row(self) -> int:
+        """
+        3 行目 (_DATA_START_ROW) 以降で最後にデータが
+        入っている行の次の行番号を返す。
+        まだ 1 件も無ければ 3 を返す。
+        """
+        self._refresh_index()
+        if not self._member_to_row:
+            return _DATA_START_ROW
+        return max(self._member_to_row.values()) + 1
+
+    # ----------------------------------------------------------
+    # 行・列インデックスを構築
+    # ----------------------------------------------------------
+    def _build_index(self) -> None:
+        header = self.ws.row_values(_HEADER_DATE_ROW)
+        msg_ids = self.ws.row_values(_MESSAGE_ID_ROW)
+
+        # ----- 列番号 → ヘッダ文字列 -------------------------
+        self._col_to_header: dict[int, str] = {
+            i: header[i - 1] for i in range(1, len(header) + 1)
+        }
+
+        # ----- メッセージ ID → 列番号 ------------------------
+        self._msgid_to_col: dict[int, int] = {}
+        for col, raw in enumerate(msg_ids, start=1):
+            val = str(raw).strip()
+            if not val:
+                continue
+            try:
+                self._msgid_to_col[int(val)] = col                 # 整数文字列
+            except ValueError:
+                try:
+                    self._msgid_to_col[int(float(val))] = col      # 1.23E+17 形式
+                except ValueError:
+                    # 変換できなければ無視（手入力ミス等）
                     continue
-                    #raise ValueError(f'Sheet.load_csv Error: part {row[0]} が見つかりません')
-                self.sheet_dict[int(row[2])] = (row[0], int(row[1]), row[3])
-                self.already_added_pult_list.append((row[0], int(row[1])))
-                
-    def save_csv(self):
-        file = open(self.filename, 'w')
-        for member_id in self.sheet_dict:
-            file.write(self.sheet_dict[member_id][0]) # part
-            file.write(',')
-            file.write(str(self.sheet_dict[member_id][1])) #pult
-            file.write(',')
-            file.write(str(member_id)) # discord id
-            file.write(',')
-            file.write(self.sheet_dict[member_id][2]) #name
-            file.write('\n')
-        file.close()
 
-    def clear(self):
-        self.sheet_dict.clear()
-        self.already_added_pult_list.clear()
-        
-    def delete(self, member: discord.Member):
-        self.already_added_pult_list.remove((self.sheet_dict[member.id][0], self.sheet_dict[member.id][1]))
-        del self.sheet_dict[member.id]
-        
-    
+        # ----- Discord ID → 行番号 ---------------------------
+        id_col = header.index("Discord ID") + 1
+        self._member_to_row: dict[int, int] = {}
+        for row_idx, raw in enumerate(
+            self.ws.col_values(id_col)[_DATA_START_ROW - 1:],
+            start=_DATA_START_ROW,
+        ):
+            val = str(raw).strip()
+            if not val:
+                continue
+            try:
+                self._member_to_row[int(val)] = row_idx            # 整数文字列
+            except ValueError:
+                try:
+                    self._member_to_row[int(float(val))] = row_idx  # 1.23E+17 形式
+                except ValueError:
+                    continue
 
-if __name__ == '__main__':
-    mae_sheet = Sheet("前")
-    mae_sheet.load_csv()
-    print(mae_sheet.sheet_dict)
-    mae_sheet.save_csv(ctx)
+    # ------------------------------------------------------------------
+    # header / 初期行の自動作成
+    # ------------------------------------------------------------------
+    def _ensure_headers(self) -> None:
+        """
+        1 行目（ヘッダ）と 2 行目（メッセージ ID 行）が無ければ作成。
+        ヘッダはプログラム数に応じて動的に生成する。
+        """
+        heads = _default_headers(self.programs)
+
+        if not any(self.ws.row_values(_HEADER_DATE_ROW)):
+            self.ws.insert_row(heads, index=_HEADER_DATE_ROW)
+
+        if not any(self.ws.row_values(_MESSAGE_ID_ROW)):
+            # ヘッダ長と同数の空セルを用意
+            self.ws.insert_row([""] * len(heads), index=_MESSAGE_ID_ROW)
+
+    # ------------------------------------------------------------------
+    # Row append
+    # ------------------------------------------------------------------
+    def append_member(
+        self,
+        program: str,
+        part: str,
+        num: int,
+        display_name: str,
+        member_id: int,
+        *,
+        overwrite: bool = False,
+    ) -> None:
+        """
+        ・discord表示名 は常に最新に上書き
+        ・パート／席次に既存値があり、かつ値が変わる場合は
+          overwrite=False なら CellOccupiedError を送出
+        """
+        with self._lock:
+            self.refresh_index()
+            heads = _default_headers(self.programs)
+
+            # ===== 既存行がある場合 =====
+            if member_id in self._member_to_row:
+                row = self._member_to_row[member_id]
+
+                # discord表示名は無条件更新
+                disp_col = heads.index("discord表示名") + 1
+                if self.ws.cell(row, disp_col).value != display_name:
+                    self.ws.update_cell(row, disp_col, display_name)
+
+                part_col = heads.index(f"{program}_パート") + 1
+                num_col = heads.index(f"{program}_席次") + 1
+
+                prev_part = self.ws.cell(row, part_col).value or ""
+                prev_num = self.ws.cell(row, num_col).value or ""
+
+                need_overwrite = (
+                    (prev_part and prev_part != part)
+                    or (prev_num and prev_num != str(num))
+                )
+
+                if need_overwrite and not overwrite:
+                    raise CellOccupiedError(
+                        row, program, prev_part, prev_num, part, num
+                    )
+
+                if need_overwrite or overwrite:
+                    self.ws.update_cell(row, part_col, part)
+                    self.ws.update_cell(row, num_col, str(num))
+
+                self._build_index()
+                return
+
+            # ===== 新規行を追加 =====
+            new_row = [""] * len(heads)
+            new_row[heads.index("discord表示名")] = display_name
+            new_row[heads.index("氏名")] = ""
+            new_row[heads.index("Discord ID")] = str(member_id)
+            new_row[heads.index(f"{program}_パート")] = part
+            new_row[heads.index(f"{program}_席次")] = str(num)
+            self.ws.insert_row(new_row, index=self._next_data_row())
+            self._build_index()
+            return
+
+
+# ------------------------------------------------------------
+# 非同期ラッパ（discord.py から呼びやすくする）
+# ------------------------------------------------------------
+class SheetAsyncBridge:
+    """同期 gspread 呼び出しを asyncio から使いやすく包む"""
+
+    def __init__(self, gs: GoogleSheetsManager) -> None:
+        self.gs = gs
+
+    async def update_status_async(
+        self,
+        message_id: int,
+        member_id: int,
+        status_name: str,
+    ) -> None:
+        await asyncio.to_thread(
+            self.gs.update_status, message_id, member_id, status_name
+        )
+
+    async def attendance_dict_async(
+        self,
+        message_id: int,
+        program: str,
+    ) -> Dict[Tuple[str, int, str], str]:
+        return await asyncio.to_thread(
+            self.gs.attendance_dict, message_id, program
+        )
+
+    async def add_event_column_async(
+        self,
+        header_str: str,
+        message_id: int,
+    ) -> int:
+        return await asyncio.to_thread(
+            self.gs.add_event_column, header_str, message_id
+        )
+
+    async def append_member_async(
+        self,
+        program: str,
+        part: str,
+        num: int,
+        display_name: str,
+        member_id: int,
+        *,
+        overwrite: bool = False,
+    ) -> None:
+        await asyncio.to_thread(
+            self.gs.append_member,
+            program,
+            part,
+            num,
+            display_name,
+            member_id,
+            overwrite=overwrite,
+        )
