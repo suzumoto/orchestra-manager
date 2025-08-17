@@ -14,6 +14,7 @@ _TOKEN_RE = re.compile(
     r"(出席|欠席|遅刻(?:\([^)]*\))?|早退(?:\([^)]*\))?)"
 )
 
+
 def _base_status(cell: str) -> str:
     """セル値から先頭の基本ステータスを取り出す"""
     for p in _STATUS_PREFIXES:
@@ -264,6 +265,49 @@ class GoogleSheetsManager:
             self.ws.insert_rows(rows, row=start_row)
             self._build_index()
 
+    def bulk_update_status_column(
+        self,
+        message_id: int,
+        values_by_member: Dict[int, str],
+    ) -> None:
+        """
+        出欠列（message_id に対応する列）に対し、Discord ID → ステータスの
+        マッピングを列全体として一括更新する。
+        列は空である前提。未反応メンバーは空文字を書き込む。
+        """
+        with self._lock:
+            self._refresh_index()
+            if message_id not in self._msgid_to_col:
+                raise KeyError(
+                    f"message_id {message_id} が列に登録されていません"
+                )
+
+            col = self._msgid_to_col[message_id]
+            if not self._member_to_row:
+                # メンバー行が無ければ書くものが無い
+                return
+
+            last_row = max(self._member_to_row.values())
+            if last_row < _DATA_START_ROW:
+                return
+
+            # 列全体の配列を作る（未反応は空）
+            values: list[list[str]] = [
+                [""] for _ in range(_DATA_START_ROW, last_row + 1)
+            ]
+
+            for member_id, status in values_by_member.items():
+                row = self._member_to_row.get(member_id)
+                if not row:
+                    continue
+                idx = row - _DATA_START_ROW
+                if 0 <= idx < len(values):
+                    values[idx][0] = status
+
+            col_a1 = self._col_to_a1(col)
+            rng = f"{col_a1}{_DATA_START_ROW}:{col_a1}{last_row}"
+            self.ws.update(rng, values)
+            
     # ------------------------------------------------------------------
     # private
     # ------------------------------------------------------------------
@@ -281,6 +325,18 @@ class GoogleSheetsManager:
             return _DATA_START_ROW
         return max(self._member_to_row.values()) + 1
 
+    @staticmethod
+    def _col_to_a1(col: int) -> str:
+        """1-indexed 列番号を A1 形式の列名に変換（1 -> A, 27 -> AA）"""
+        if col <= 0:
+            raise ValueError("col must be >= 1")
+        s = ""
+        n = col
+        while n:
+            n, rem = divmod(n - 1, 26)
+            s = chr(65 + rem) + s
+        return s
+    
     # ----------------------------------------------------------
     # 行・列インデックスを構築
     # ----------------------------------------------------------
@@ -464,4 +520,15 @@ class SheetAsyncBridge:
             display_name,
             member_id,
             overwrite=overwrite,
+        )
+
+    async def bulk_update_status_column_async(
+        self,
+        message_id: int,
+        values_by_member: Dict[int, str],
+    ) -> None:
+        await asyncio.to_thread(
+            self.gs.bulk_update_status_column,
+            message_id,
+            values_by_member,
         )

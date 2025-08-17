@@ -10,6 +10,7 @@ from datetime import timezone, timedelta, datetime
 import discord
 from discord.ext import commands
 from gspread.exceptions import GSpreadException
+from gspread.exceptions import APIError
 
 from draw import PlayerBoxDrawer, BLACK
 from seat_layout_slides import SeatLayoutSlides
@@ -417,9 +418,20 @@ async def on_raw_reaction_add(
     # ✅: 練習日列の手動追加 -----------------------------------
     if emoji_name == CHECKMARK_EMOJI:
         msg = await channel.fetch_message(message_id)
+
+        # 0) 列の追加（既存なら既存列番号が返るだけ）
         date_iso = _extract_date_string(msg)
         header_str = _format_japanese_date(date_iso)
         await sheet_bridge.add_event_column_async(header_str, message_id)
+
+        # 1) リアクションを集計して列一括更新（1 API call）
+        values_by_member = await _collect_attendance_from_reactions(msg)
+        await sheet_bridge.bulk_update_status_column_async(
+            message_id,
+            values_by_member,
+        )
+
+        # 2) ✅ を消す
         await msg.remove_reaction(payload.emoji, member)
         return
 
@@ -620,6 +632,126 @@ def _draw_attendance_chart(
     drawer.save(out_path)
     return out_path
 
+
+async def _safe_fetch_member(
+    guild: discord.Guild,
+    user_id: int,
+) -> discord.Member | None:
+    """キャッシュに無ければ fetch。見つからなければ None"""
+    member = guild.get_member(user_id)
+    if member:
+        return member
+    try:
+        return await guild.fetch_member(user_id)
+    except discord.NotFound:
+        return None
+
+
+async def _reflect_reactions_to_sheet(msg: discord.Message) -> None:
+    """
+    1. msg についている出欠リアクションをすべて走査
+    2. Spread Sheet に 1 件ずつ反映（直列）
+    3. 遅刻／早退は DM で時刻プロンプト
+    """
+    guild = msg.guild
+    if guild is None:
+        return
+
+    for reaction in msg.reactions:
+        emoji_name = _norm_emoji(getattr(reaction.emoji, "name", str(reaction.emoji)))
+        status = status_from_emoji(emoji_name)
+        if status is None:
+            continue  # 出欠系ではない
+
+        async for user in reaction.users():
+            if user.bot:
+                continue
+
+            member = await _safe_fetch_member(guild, user.id)
+            if member is None:
+                # 退室済みなどで取得不可
+                continue
+
+            # ------------- シート更新（直列で実行） -------------
+            try:
+                await sheet_bridge.update_status_async(msg.id, member.id, status)
+            except APIError as exc:
+                # ここで 429 が出ても次のユーザーへ進む
+                print(f"⚠️ Sheets API error while updating {member}: {exc}")
+                continue
+
+            # ------------- 遅刻／早退 → DM プロンプト -------------
+            if status in {"遅刻", "早退"}:
+                # 同じメンバーに既にプロンプト送信済みかをチェック
+                already_sent = any(
+                    ctx[0] == msg.id  # 同じサーバーメッセージ
+                    and prompt_id in _PROMPT_CONTEXT
+                    and (await msg.channel.fetch_message(prompt_id)).author.id == member.id
+                    for prompt_id, ctx in _PROMPT_CONTEXT.items()
+                )
+                if already_sent:
+                    continue
+
+                date_iso = _extract_date_string(msg)
+                date_jp = _format_japanese_date_short(date_iso)
+                await _send_time_prompt(
+                    member=member,
+                    server_message_id=msg.id,
+                    date_str_jp=date_jp,
+                    status=status,
+                )
+
+
+async def _collect_attendance_from_reactions(
+    msg: discord.Message,
+) -> dict[int, str]:
+    """
+    メッセージに付いた出欠リアクションを全走査し、
+    {member_id: status_raw} を構築して返す。
+    仕様:
+      - 出席があれば『出席』で確定（欠席/遅刻/早退は無視）
+      - 出席が無く欠席があれば『欠席』
+      - 上記が無ければ『遅刻』『早退』を同時併記可（時刻なし）
+      - 何も無ければ辞書に含めない（= 空セルのまま）
+    """
+    guild = msg.guild
+    if guild is None:
+        return {}
+
+    reacted: dict[int, set[str]] = {}
+
+    for reaction in msg.reactions:
+        emoji_name = _norm_emoji(
+            getattr(reaction.emoji, "name", str(reaction.emoji))
+        )
+        status = status_from_emoji(emoji_name)
+        if status is None:
+            continue
+
+        async for user in reaction.users():
+            if user.bot:
+                continue
+            if user.id not in reacted:
+                reacted[user.id] = set()
+            reacted[user.id].add(status)
+
+    result: dict[int, str] = {}
+    for mid, statuses in reacted.items():
+        if "出席" in statuses:
+            result[mid] = "出席"
+            continue
+        if "欠席" in statuses:
+            result[mid] = "欠席"
+            continue
+        parts: list[str] = []
+        if "遅刻" in statuses:
+            parts.append("遅刻")
+        if "早退" in statuses:
+            parts.append("早退")
+        if parts:
+            result[mid] = " ".join(parts)
+
+    return result
 
 # ------------------------------------------------------------
 # 日付文字列抽出（メッセージ本文 1 行目から yyyy-mm-dd / yyyy/mm/dd を検索）
