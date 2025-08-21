@@ -242,8 +242,8 @@ class GoogleSheetsManager:
                 except (ValueError, TypeError):
                     num = 0
                 name = (
-                    str(rec.get("discord表示名") or "").strip()
-                    or str(rec.get("氏名") or "").strip()
+                    str(rec.get("氏名") or "").strip()
+                    or str(rec.get("discord表示名") or "").strip()
                     or "???"
                 )
 
