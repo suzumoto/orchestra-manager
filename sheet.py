@@ -167,7 +167,7 @@ class GoogleSheetsManager:
             return mapping
 
         # -------- 行・列の特定 --------------------------------
-        self._refresh_index()  # ← 前回答の Lock 対応が入っている想定
+        self._refresh_index()  # ← Lock とインデックス再構築
         col = self._msgid_to_col[message_id]
         row = self._member_to_row[member_id]
 
@@ -307,7 +307,7 @@ class GoogleSheetsManager:
             col_a1 = self._col_to_a1(col)
             rng = f"{col_a1}{_DATA_START_ROW}:{col_a1}{last_row}"
             self.ws.update(rng, values)
-            
+
     # ------------------------------------------------------------------
     # private
     # ------------------------------------------------------------------
@@ -336,7 +336,7 @@ class GoogleSheetsManager:
             n, rem = divmod(n - 1, 26)
             s = chr(65 + rem) + s
         return s
-    
+
     # ----------------------------------------------------------
     # 行・列インデックスを構築
     # ----------------------------------------------------------
@@ -418,7 +418,7 @@ class GoogleSheetsManager:
           overwrite=False なら CellOccupiedError を送出
         """
         with self._lock:
-            self.refresh_index()
+            self._refresh_index()
             heads = _default_headers(self.programs)
 
             # ===== 既存行がある場合 =====

@@ -35,8 +35,17 @@ if not BOT_TOKEN:
     raise RuntimeError("環境変数 DISCORD_BOT_TOKEN が未設定です。")
 
 COMMAND_CHANNELS = {v for v in config["COMMAND_CHANNEL"].values()}
-RSVP_CHANNELS = {v for v in config["RSVP_CHANNEL"].values()}
 OUTPUT_CHANNEL = config["OUTPUT_CHANNEL"]["output_channel"]
+
+# RSVP チャンネル → シートのマッピングを構築
+RSVP_CHANNELS_ENSOU: set[str] = set()
+RSVP_CHANNELS_BUNSOU: set[str] = set()
+for k, v in config["RSVP_CHANNEL"].items():
+    if k.endswith("_1"):
+        RSVP_CHANNELS_ENSOU.add(v)
+    elif k.endswith("_2"):
+        RSVP_CHANNELS_BUNSOU.add(v)
+RSVP_CHANNELS: set[str] = RSVP_CHANNELS_ENSOU | RSVP_CHANNELS_BUNSOU
 
 EMOJI_NAME = {
     "出席": config["EMOJI"]["shusseki"],
@@ -74,14 +83,49 @@ SPREADSHEET_ID = os.getenv("SPREADSHEET_ID")
 if not SPREADSHEET_ID:
     raise RuntimeError("環境変数 SPREADSHEET_ID が未設定です。")
 
-gs_manager = GoogleSheetsManager(
+# シート名の設定（デフォルト: 全奏 / 分奏）
+ENSOU_SHEET_NAME = config["SPREADSHEET"].get(
+    "ensou_worksheet_name",
+    config["SPREADSHEET"].get("worksheet_name", "全奏"),
+)
+BUNSOU_SHEET_NAME = config["SPREADSHEET"].get("bunsou_worksheet_name", "分奏")
+
+# 全奏 / 分奏 それぞれのマネージャとブリッジ
+gs_manager_ensou = GoogleSheetsManager(
     spreadsheet_id=SPREADSHEET_ID,
-    worksheet_name=config["SPREADSHEET"]["worksheet_name"],
-    credential_json=config["SPREADSHEET"].get("credential_json",
-                                              "credentials.json"),
+    worksheet_name=ENSOU_SHEET_NAME,
+    credential_json=config["SPREADSHEET"].get("credential_json", "credentials.json"),
     programs=PROGRAMS,
 )
-sheet_bridge = SheetAsyncBridge(gs_manager)
+gs_manager_bunsou = GoogleSheetsManager(
+    spreadsheet_id=SPREADSHEET_ID,
+    worksheet_name=BUNSOU_SHEET_NAME,
+    credential_json=config["SPREADSHEET"].get("credential_json", "credentials.json"),
+    programs=PROGRAMS,
+)
+sheet_bridge_ensou = SheetAsyncBridge(gs_manager_ensou)
+sheet_bridge_bunsou = SheetAsyncBridge(gs_manager_bunsou)
+
+# シートキーの定義
+SHEET_KEY_ENSOU = "ensou"
+SHEET_KEY_BUNSOU = "bunsou"
+
+
+def _sheet_key_from_channel_name(ch_name: str) -> str | None:
+    if ch_name in RSVP_CHANNELS_ENSOU:
+        return SHEET_KEY_ENSOU
+    if ch_name in RSVP_CHANNELS_BUNSOU:
+        return SHEET_KEY_BUNSOU
+    return None
+
+
+def _bridge_for_sheet_key(sheet_key: str) -> SheetAsyncBridge:
+    if sheet_key == SHEET_KEY_ENSOU:
+        return sheet_bridge_ensou
+    if sheet_key == SHEET_KEY_BUNSOU:
+        return sheet_bridge_bunsou
+    raise ValueError(f"unknown sheet_key: {sheet_key}")
+
 
 PRESENTATION_ID = os.getenv("SLIDES_PRESENTATION_ID")
 if not PRESENTATION_ID:
@@ -89,8 +133,7 @@ if not PRESENTATION_ID:
 
 layout = SeatLayoutSlides(
     presentation_id=PRESENTATION_ID,
-    credential_json=config["SLIDES"].get("credential_json",
-                                         "credentials.json"),
+    credential_json=config["SLIDES"].get("credential_json", "credentials.json"),
     slide_index=int(config["SLIDES"].get("slide_index", 1)),
 )
 LEGEND_COLOR = {
@@ -163,6 +206,7 @@ async def _send_time_prompt(
     server_message_id: int,
     date_str_jp: str,
     status: str,
+    sheet_key: str,
 ) -> None:
     dm = await member.create_dm()
     verb = "到着" if status == "遅刻" else "退出"
@@ -174,7 +218,7 @@ async def _send_time_prompt(
     sent = await dm.send(prompt)
 
     # --- コンテキスト記録 & 保存 ----------------------
-    _PROMPT_CONTEXT[sent.id] = (server_message_id, status)
+    _PROMPT_CONTEXT[sent.id] = (server_message_id, status, sheet_key)
     await asyncio.to_thread(_save_prompt_context, _PROMPT_CONTEXT)
 
 
@@ -184,12 +228,23 @@ async def _send_time_prompt(
 _PROMPT_CONTEXT_FILE = Path("prompt_context.json")
 
 
-def _load_prompt_context() -> dict[int, tuple[int, str]]:
+def _load_prompt_context() -> dict[int, tuple[int, str, str]]:
     """JSON から復元。存在しなければ空 dict"""
     try:
         data = json.loads(_PROMPT_CONTEXT_FILE.read_text(encoding="utf-8"))
-        # key は str で保存しているので int に戻す
-        return {int(k): tuple(v) for k, v in data.items()}
+        ctx: dict[int, tuple[int, str, str]] = {}
+        for k, v in data.items():
+            if isinstance(v, list | tuple):
+                if len(v) == 3:
+                    server_id, status, sheet_key = v
+                elif len(v) == 2:
+                    # 後方互換（旧フォーマットは ensou 扱い）
+                    server_id, status = v
+                    sheet_key = SHEET_KEY_ENSOU
+                else:
+                    continue
+                ctx[int(k)] = (int(server_id), str(status), str(sheet_key))
+        return ctx
     except FileNotFoundError:
         return {}
     except Exception:
@@ -197,7 +252,7 @@ def _load_prompt_context() -> dict[int, tuple[int, str]]:
         return {}
 
 
-def _save_prompt_context(ctx: dict[int, tuple[int, str]]) -> None:
+def _save_prompt_context(ctx: dict[int, tuple[int, str, str]]) -> None:
     """dict を JSON へ保存"""
     tmp = {str(k): list(v) for k, v in ctx.items()}
     _PROMPT_CONTEXT_FILE.write_text(
@@ -212,7 +267,7 @@ def _detect_part_from_roles(member: discord.Member) -> str | None:
     """Discord Member のロールからパート名を推定。該当無しなら None"""
     for pattern, part in _ROLE_PATTERNS:
         if any(pattern.match(role.name) for role in member.roles):
-            return _canon_part(part)          # ← ここで正規化
+            return _canon_part(part)
     return None
 
 
@@ -247,9 +302,12 @@ def _insert_member_row_if_absent(
 
 
 # ============================================================
-# ギルドメンバー → SpreadSheet 同期
+# ギルドメンバー → SpreadSheet 同期（全奏のみ）
 # ============================================================
-async def _sync_members_to_sheet(guild: discord.Guild) -> tuple[int, int]:
+async def _sync_members_to_sheet(
+    guild: discord.Guild,
+    gs: GoogleSheetsManager,
+) -> tuple[int, int]:
     """
     既存行は変更せず、新規メンバーだけを追加する。
     Returns
@@ -261,7 +319,6 @@ async def _sync_members_to_sheet(guild: discord.Guild) -> tuple[int, int]:
     added_no_part = 0
     rows_to_append: list[list[str]] = []
 
-    gs = sheet_bridge.gs               # short-hand
     heads = _default_headers(gs.programs)
 
     def _build_row(member: discord.Member, part_norm: str | None) -> list[str]:
@@ -284,12 +341,12 @@ async def _sync_members_to_sheet(guild: discord.Guild) -> tuple[int, int]:
         else:
             added_no_part += 1
 
-    # ---- gspread  I/O はスレッドへ ------------------------
     await asyncio.to_thread(gs.append_rows_bulk, rows_to_append)
     return added_with_part, added_no_part
 
-# prompt_msg.id → (server_message_id, status) を保持
-_PROMPT_CONTEXT: dict[int, tuple[int, str]] = _load_prompt_context()
+
+# prompt_msg.id → (server_message_id, status, sheet_key) を保持
+_PROMPT_CONTEXT: dict[int, tuple[int, str, str]] = _load_prompt_context()
 
 
 # ============================================================
@@ -309,25 +366,28 @@ async def on_ready() -> None:  # type: ignore[override]
 
     if not _SYNC_DONE_ON_STARTUP:
         for g in bot.guilds:
-            asyncio.create_task(_sync_members_to_sheet(g))
+            # メンバー同期は「全奏」シートのみ
+            asyncio.create_task(_sync_members_to_sheet(g, gs_manager_ensou))
         _SYNC_DONE_ON_STARTUP = True
 
 
 @bot.event
 async def on_message(message: discord.Message) -> None:
     # RSVP チャンネルで投稿があったら自動でリアクションを付与
-    if str(message.channel) in RSVP_CHANNELS and not message.author.bot:
+    ch_name = str(message.channel)
+    if ch_name in RSVP_CHANNELS and not message.author.bot:
         for key in ("出席", "欠席", "遅刻", "早退"):
-            emoji = discord.utils.get(message.guild.emojis,
-                                      name=EMOJI_NAME[key])
+            emoji = discord.utils.get(message.guild.emojis, name=EMOJI_NAME[key])
             if emoji:
                 await message.add_reaction(emoji)
 
         # まだ Sheets にメッセージ ID 未登録なら列を追加して登録
-        # 変更: ヘッダを 'yyyy年mm月dd日(曜)' 形式で登録
         date_iso = _extract_date_string(message)
         header_str = _format_japanese_date(date_iso)
-        await sheet_bridge.add_event_column_async(header_str, message.id)
+        sheet_key = _sheet_key_from_channel_name(ch_name)
+        if sheet_key:
+            bridge = _bridge_for_sheet_key(sheet_key)
+            await bridge.add_event_column_async(header_str, message.id)
 
     await bot.process_commands(message)  # これを忘れるとコマンドが動かない
 
@@ -342,7 +402,7 @@ async def on_message(message: discord.Message) -> None:
             ref_id = message.reference.message_id
             ctx = _PROMPT_CONTEXT.get(ref_id)
             if ctx:
-                server_msg_id, status = ctx
+                server_msg_id, status, sheet_key = ctx
                 time_str = message.content.strip()
                 if not _valid_time(time_str):
                     await message.channel.send(
@@ -355,7 +415,8 @@ async def on_message(message: discord.Message) -> None:
                     else:  # 早退
                         cell_value = f"早退(～{time_str})"
 
-                    await sheet_bridge.update_status_async(
+                    bridge = _bridge_for_sheet_key(sheet_key)
+                    await bridge.update_status_async(
                         server_msg_id,
                         message.author.id,
                         cell_value,
@@ -407,8 +468,16 @@ async def on_raw_reaction_add(
     # 以降、payload.member ではなく member を使用
     # -------------------------------------------------
     channel = guild.get_channel(payload.channel_id)
-    if channel is None or str(channel) not in RSVP_CHANNELS:
+    if channel is None:
         return
+    ch_name = str(channel)
+    if ch_name not in RSVP_CHANNELS:
+        return
+
+    sheet_key = _sheet_key_from_channel_name(ch_name)
+    if sheet_key is None:
+        return
+    bridge = _bridge_for_sheet_key(sheet_key)
 
     raw_name = payload.emoji.name
     emoji_name = _norm_emoji(raw_name)
@@ -417,21 +486,18 @@ async def on_raw_reaction_add(
     # 出席系ステータス更新 ------------------------------------
     status = status_from_emoji(emoji_name)
     if status:
-        await sheet_bridge.update_status_async(
-            message_id, member.id, status
-        )
+        await bridge.update_status_async(message_id, member.id, status)
 
         # ---- 遅刻／早退 → DM で時刻を問い合わせ ----
         if status in {"遅刻", "早退"}:
-            date_iso = _extract_date_string(
-                await channel.fetch_message(message_id)
-            )
+            date_iso = _extract_date_string(await channel.fetch_message(message_id))
             date_str_jp = _format_japanese_date_short(date_iso)
             await _send_time_prompt(
                 member=member,
                 server_message_id=message_id,
                 date_str_jp=date_str_jp,
                 status=status,
+                sheet_key=sheet_key,
             )
         return
 
@@ -442,11 +508,11 @@ async def on_raw_reaction_add(
         # 0) 列の追加（既存なら既存列番号が返るだけ）
         date_iso = _extract_date_string(msg)
         header_str = _format_japanese_date(date_iso)
-        await sheet_bridge.add_event_column_async(header_str, message_id)
+        await bridge.add_event_column_async(header_str, message_id)
 
         # 1) リアクションを集計して列一括更新（1 API call）
         values_by_member = await _collect_attendance_from_reactions(msg)
-        await sheet_bridge.bulk_update_status_column_async(
+        await bridge.bulk_update_status_column_async(
             message_id,
             values_by_member,
         )
@@ -469,14 +535,11 @@ async def on_raw_reaction_add(
 
     out_ch: discord.TextChannel | None = None
     if send_mode == "channel":
-        out_ch = discord.utils.get(guild.channels,
-                                   name=OUTPUT_CHANNEL) or channel
+        out_ch = discord.utils.get(guild.channels, name=OUTPUT_CHANNEL) or channel
 
     for prog in PROGRAMS:
         try:
-            attendance = await sheet_bridge.attendance_dict_async(
-                message_id, prog
-            )
+            attendance = await bridge.attendance_dict_async(message_id, prog)
         except GSpreadException as exc:
             if "contains duplicates" in str(exc):
                 msg_text = (
@@ -523,7 +586,7 @@ async def append_prefix_cmd(
     part: str,
     num: int,
 ) -> None:
-    """乗り番（パート・席次）を SpreadSheet に登録する"""
+    """乗り番（パート・席次）を SpreadSheet に登録する（全奏のみ）"""
     # ---------- 入力チェック ----------
     if program not in PROGRAMS:
         await ctx.send(
@@ -533,7 +596,7 @@ async def append_prefix_cmd(
         return
 
     try:
-        await sheet_bridge.append_member_async(
+        await sheet_bridge_ensou.append_member_async(
             program=program,
             part=part,
             num=num,
@@ -561,9 +624,7 @@ async def append_prefix_cmd(
             )
 
         try:
-            reaction, _ = await bot.wait_for(
-                "reaction_add", timeout=30.0, check=check
-            )
+            reaction, _ = await bot.wait_for("reaction_add", timeout=30.0, check=check)
         except asyncio.TimeoutError:
             await warn.edit(content="タイムアウトしました。上書きは行われませんでした。")
             return
@@ -574,7 +635,7 @@ async def append_prefix_cmd(
             return
 
         # -------- 上書き実行（✅ が押された場合） ----------
-        await sheet_bridge.append_member_async(
+        await sheet_bridge_ensou.append_member_async(
             program=program,
             part=part,
             num=num,
@@ -589,16 +650,16 @@ async def append_prefix_cmd(
 
 
 # ============================================================
-# コマンド: サーバーメンバー → SpreadSheet 同期
+# コマンド: サーバーメンバー → SpreadSheet 同期（全奏のみ）
 # ============================================================
 @bot.command(
     name="syncmembers",
     help="$ syncmembers : サーバーメンバーの Discord 表示名 / ID を "
-         "SpreadSheet に追加または上書き",
+         "SpreadSheet（全奏）に追加または上書き",
 )
 @commands.has_any_role(*OUTPUT_ROLES)
 async def sync_members_cmd(ctx: commands.Context) -> None:
-    with_part, no_part = await _sync_members_to_sheet(ctx.guild)
+    with_part, no_part = await _sync_members_to_sheet(ctx.guild, gs_manager_ensou)
     await ctx.send(
         f"✅ 同期完了: 追加 {with_part + no_part} 名 "
         f"パート判定あり {with_part} 名, "
@@ -694,7 +755,12 @@ async def _reflect_reactions_to_sheet(msg: discord.Message) -> None:
 
             # ------------- シート更新（直列で実行） -------------
             try:
-                await sheet_bridge.update_status_async(msg.id, member.id, status)
+                # どのシートかは msg.channel 名から判定
+                sheet_key = _sheet_key_from_channel_name(str(msg.channel))
+                if not sheet_key:
+                    continue
+                bridge = _bridge_for_sheet_key(sheet_key)
+                await bridge.update_status_async(msg.id, member.id, status)
             except APIError as exc:
                 # ここで 429 が出ても次のユーザーへ進む
                 print(f"⚠️ Sheets API error while updating {member}: {exc}")
@@ -702,16 +768,6 @@ async def _reflect_reactions_to_sheet(msg: discord.Message) -> None:
 
             # ------------- 遅刻／早退 → DM プロンプト -------------
             if status in {"遅刻", "早退"}:
-                # 同じメンバーに既にプロンプト送信済みかをチェック
-                already_sent = any(
-                    ctx[0] == msg.id  # 同じサーバーメッセージ
-                    and prompt_id in _PROMPT_CONTEXT
-                    and (await msg.channel.fetch_message(prompt_id)).author.id == member.id
-                    for prompt_id, ctx in _PROMPT_CONTEXT.items()
-                )
-                if already_sent:
-                    continue
-
                 date_iso = _extract_date_string(msg)
                 date_jp = _format_japanese_date_short(date_iso)
                 await _send_time_prompt(
@@ -719,6 +775,7 @@ async def _reflect_reactions_to_sheet(msg: discord.Message) -> None:
                     server_message_id=msg.id,
                     date_str_jp=date_jp,
                     status=status,
+                    sheet_key=sheet_key,
                 )
 
 
@@ -787,7 +844,7 @@ _DATE_RE_JP = re.compile(r"(\d{1,2})月(\d{1,2})日")
 
 def _extract_date_string(msg: discord.Message) -> str:
     """メッセージ本文から日付を探す。見つからなければ投稿日時を返す。"""
-    text_first = msg.content.splitlines()[0]
+    text_first = msg.content.splitlines()[0] if msg.content else ""
 
     # --- yyyy-mm-dd 明示パターン ------------------------
     m_full = _DATE_RE_FULL.search(text_first)
