@@ -331,30 +331,50 @@ async def on_message(message: discord.Message) -> None:
 
     await bot.process_commands(message)  # これを忘れるとコマンドが動かない
 
-    # ===== DM 返信での遅刻／早退時刻登録 ====================
-    if message.guild is None and message.reference:
-        ref_id = message.reference.message_id
-        ctx = _PROMPT_CONTEXT.get(ref_id)
-        if ctx:
-            server_msg_id, status = ctx
-            time_str = message.content.strip()
-            if not _valid_time(time_str):
-                await message.channel.send(
-                    "❌ 形式が正しくありませんでした。"
-                    "HH:MM（24 時間制）で入力し直してください。"
-                )
-            else:
-                if status == "遅刻":
-                    cell_value = f"遅刻({time_str}～)"
-                else:  # 早退
-                    cell_value = f"早退(～{time_str})"
+    # ===== DM 返信での遅刻／早退時刻登録＋非返信DMの案内 ====================
+    if message.guild is None:
+        # Bot が送った DM メッセージには反応しない（無限ループ防止）
+        if message.author.bot:
+            return
 
-                await sheet_bridge.update_status_async(
-                    server_msg_id,
-                    message.author.id,
-                    cell_value,
+        if message.reference:
+            # 返信として届いた DM
+            ref_id = message.reference.message_id
+            ctx = _PROMPT_CONTEXT.get(ref_id)
+            if ctx:
+                server_msg_id, status = ctx
+                time_str = message.content.strip()
+                if not _valid_time(time_str):
+                    await message.channel.send(
+                        "❌ 形式が正しくありませんでした。"
+                        "HH:MM（24 時間制）で入力し直してください。"
+                    )
+                else:
+                    if status == "遅刻":
+                        cell_value = f"遅刻({time_str}～)"
+                    else:  # 早退
+                        cell_value = f"早退(～{time_str})"
+
+                    await sheet_bridge.update_status_async(
+                        server_msg_id,
+                        message.author.id,
+                        cell_value,
+                    )
+                    await message.add_reaction("✅")
+            else:
+                # 返信ではあるが、当Botの確認メッセージへの返信ではない
+                await message.channel.send(
+                    "この返信は当Botの確認メッセージに紐付いていないため処理できませんでした。\n"
+                    "遅刻/早退の時刻を登録するには、当Botが送信した『確認メッセージ』に対して返信してください。\n"
+                    "スマホではメッセージを長押しして「返信」を選択してください。"
                 )
-                await message.add_reaction("✅")
+        else:
+            # 返信でない DM はガイダンスを返す
+            await message.channel.send(
+                "このDMには自動対応していません。\n"
+                "遅刻/早退の時刻を登録するには、当Botが送信した『確認メッセージ』に対して返信してください。\n"
+                "スマホではメッセージを長押しして「返信」を選択してください。"
+            )
 
 
 @bot.event
