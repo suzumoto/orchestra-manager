@@ -194,10 +194,27 @@ def _valid_time(text: str) -> bool:
 # Part 名の正規化ユーティリティ
 # ------------------------------------------------------------
 def _canon_part(part: str | None) -> str | None:
-    """先頭大文字・残り小文字へ統一。None はそのまま返す。"""
+    """
+    パート表記の正規化。
+    - 英字の連続セグメントごとに「先頭大文字＋残り小文字」
+    - 英数字以外（例: &, -, /, 空白）でセグメントを区切る（記号自体は保持）
+    例:
+      'vn1st'   -> 'Vn1st'
+      'PF&cel'  -> 'Pf&Cel'
+    """
     if part is None:
         return None
-    return part[:1].upper() + part[1:].lower()
+    s = part.strip()
+    out: list[str] = []
+    new_seg = True
+    for ch in s:
+        if ch.isalpha():
+            out.append(ch.upper() if new_seg else ch.lower())
+            new_seg = False
+        else:
+            out.append(ch)
+            new_seg = not ch.isalnum()
+    return "".join(out)
 
 
 async def _send_time_prompt(

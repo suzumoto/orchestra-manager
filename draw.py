@@ -41,9 +41,7 @@ class PlayerBoxDrawer:
                        name: str,
                        fill_color: Tuple[int, int, int],
                        font_color: Tuple[int, int, int]) -> None:
-        key = (part, num)
-        if key not in self.seat_layout.seats:
-            raise ValueError(f"座標未定義: {key}")
+        key = self._resolve_seat_key(part, num)
 
         info = self.seat_layout.seats[key]
         cx, cy = info["center"]
@@ -71,9 +69,7 @@ class PlayerBoxDrawer:
         fill_right: tuple[int, int, int],
         font_color: tuple[int, int, int] = BLACK,
     ) -> None:
-        key = (part, num)
-        if key not in self.seat_layout.seats:
-            raise ValueError(f"座標未定義: {key}")
+        key = self._resolve_seat_key(part, num)
 
         info = self.seat_layout.seats[key]
         cx, cy = info["center"]
@@ -148,6 +144,21 @@ class PlayerBoxDrawer:
     # =================================================
     # 内部描画ヘルパ
     # =================================================
+    def _resolve_seat_key(self, part: str, num: int) -> tuple[str, int]:
+        """
+        Slides 側の座席キーを解決する。
+        - まず厳密一致 (part, num)
+        - 見つからなければ、part の大小文字を無視して探索
+        """
+        key = (part, num)
+        if key in self.seat_layout.seats:
+            return key
+        lower = part.lower()
+        for (p, n) in self.seat_layout.seats.keys():
+            if n == num and p.lower() == lower:
+                return (p, n)
+        raise ValueError(f"座標未定義: {(part, num)}")
+
     def _draw_conductor(self) -> None:
         pos = self.seat_layout.conductor_pos or (960, 110)
         cx, cy = pos
