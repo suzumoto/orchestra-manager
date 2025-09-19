@@ -20,7 +20,7 @@ from googleapiclient.errors import HttpError
 # 出力画像サイズ（draw.py と揃える）
 IMG_W, IMG_H = 1920, 1080
 
-_PART_NUM_RE = re.compile(r'^([A-Za-z0-9]+)-(\d+)$')
+_PART_NUM_RE = re.compile(r'^([A-Za-z0-9&]+)-(\d+)$')
 _LEGEND_SET = {"出席", "欠席", "遅刻", "早退", "未回答"}
 _CACHE_DIR = Path(".seat_layout_cache")
 _CACHE_DIR.mkdir(exist_ok=True)
