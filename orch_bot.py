@@ -148,9 +148,33 @@ intents = discord.Intents.all()
 bot = commands.Bot(command_prefix="$", intents=intents)
 
 
+# ------------------------------------------------------------
+# [修正] 絵文字判定ロジック
+# ------------------------------------------------------------
+
+def _extract_emoji_name_from_tag(text: str) -> str:
+    """
+    設定ファイル等の文字列が <:name:id> 形式なら name を返す。
+    それ以外（Unicode絵文字や単純な文字列）ならそのまま返す。
+    """
+    # <a:name:id> (アニメーション) または <:name:id> (通常) に対応
+    m = re.match(r"<a?:([^:]+):\d+>", text)
+    if m:
+        return m.group(1)
+    return text
+
+
 def status_from_emoji(emoji_name: str) -> str | None:
+    """
+    リアクションの絵文字名が、設定ファイルのどのステータスに該当するか判定する。
+    設定値が <:shusseki:123...> の形式でも、名前(shusseki)で比較を行う。
+    """
     for status, ename in EMOJI_NAME.items():
-        if emoji_name == ename and status in {"出席", "欠席", "遅刻", "早退"}:
+        # 設定値(ename)から名前部分だけを抽出
+        config_name = _extract_emoji_name_from_tag(ename)
+        
+        # emoji_name は _norm_emoji 済み前提 (VS16除去済み)
+        if emoji_name == config_name and status in {"出席", "欠席", "遅刻", "早退"}:
             return status
     return None
 
