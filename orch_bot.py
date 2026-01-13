@@ -371,6 +371,54 @@ _PROMPT_CONTEXT: dict[int, tuple[int, str, str]] = _load_prompt_context()
 # ============================================================
 _SYNC_DONE_ON_STARTUP = False
 
+# ============================================================
+# [追加] 同期用: 最新RSVPメッセージの状態をシートへ強制同期
+# ============================================================
+async def _sync_latest_rsvp_in_guild(guild: discord.Guild) -> int:
+    """
+    RSVPチャンネルの最新メッセージを取得し、
+    リアクション状況をSpreadSheetに一括同期する。
+    Returns: 同期したメッセージ(チャンネル)数
+    """
+    synced_count = 0
+    
+    # 全てのRSVPチャンネル（全奏・分奏含む）を走査
+    for ch_name in RSVP_CHANNELS:
+        channel = discord.utils.get(guild.text_channels, name=ch_name)
+        if not channel:
+            continue
+
+        # どのシートに対応するか判定
+        sheet_key = _sheet_key_from_channel_name(ch_name)
+        if not sheet_key:
+            continue
+        
+        # 対応するブリッジを取得
+        bridge = _bridge_for_sheet_key(sheet_key)
+
+        # 最新の1件だけを取得（これが最新の練習日程案内とみなす）
+        async for msg in channel.history(limit=1):
+            try:
+                date_iso = _extract_date_string(msg)
+                header_str = _format_japanese_date(date_iso)
+            except Exception:
+                continue
+
+            # 1. 列の確保
+            await bridge.add_event_column_async(header_str, msg.id)
+
+            # 2. リアクション集計
+            values_by_member = await _collect_attendance_from_reactions(msg)
+
+            # 3. シートへ一括反映
+            await bridge.bulk_update_status_column_async(
+                msg.id,
+                values_by_member,
+            )
+            synced_count += 1
+            print(f"Synced RSVP: {ch_name} ({sheet_key}) - {header_str}")
+
+    return synced_count
 
 # ============================================================
 # イベントハンドラ
@@ -383,10 +431,18 @@ async def on_ready() -> None:  # type: ignore[override]
 
     if not _SYNC_DONE_ON_STARTUP:
         for g in bot.guilds:
-            # メンバー同期は「全奏」シートのみ
+            # 1. メンバー情報の同期（全奏シートのみを正とする運用のようなのでこのまま）
+            print(f"Syncing members for guild: {g.name}...")
             asyncio.create_task(_sync_members_to_sheet(g, gs_manager_ensou))
+            
+            # 2. [復元] 最新RSVP(回答)状況の同期
+            print(f"Syncing latest RSVP for guild: {g.name}...")
+            # ここは非同期タスクとして投げっぱなしにするか、awaitするかは運用次第ですが
+            # on_readyがブロックされるのを防ぐなら create_task が安全です
+            asyncio.create_task(_sync_latest_rsvp_in_guild(g))
+
         _SYNC_DONE_ON_STARTUP = True
-        print("Startup sync completed.")
+        print("Startup sync initiated.")
 
 
 @bot.event
