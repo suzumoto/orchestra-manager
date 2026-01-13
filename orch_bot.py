@@ -386,6 +386,7 @@ async def on_ready() -> None:  # type: ignore[override]
             # メンバー同期は「全奏」シートのみ
             asyncio.create_task(_sync_members_to_sheet(g, gs_manager_ensou))
         _SYNC_DONE_ON_STARTUP = True
+        print("Startup sync completed.")
 
 
 @bot.event
@@ -684,6 +685,23 @@ async def sync_members_cmd(ctx: commands.Context) -> None:
     )
     await ctx.message.add_reaction("✅")
 
+@bot.command(
+    name="sync",
+    help="$ sync : 最新のRSVP回答状況をスプレッドシートに強制同期",
+)
+@commands.has_any_role(*OUTPUT_ROLES)
+async def sync_rsvp_cmd(ctx: commands.Context) -> None:
+    """現在のDiscord RSVP Channelの最新回答に合わせてシートを更新する"""
+    
+    # Command_channel 以外での実行を制限したい場合は以下のコメントアウトを外す
+    # if str(ctx.channel) not in COMMAND_CHANNELS:
+    #     return
+    msg = await ctx.send("🔄 最新の回答状況を同期中...")
+    
+    count = await _sync_latest_rsvp_in_guild(ctx.guild)
+    
+    await msg.edit(content=f"✅ 同期完了: {count} 件のRSVPチャンネルを更新しました。")
+    await ctx.message.add_reaction("✅")
 
 # ============================================================
 # その他ヘルパ
