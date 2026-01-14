@@ -273,7 +273,10 @@ class GoogleSheetsManager:
         """
         出欠列（message_id に対応する列）に対し、Discord ID → ステータスの
         マッピングを列全体として一括更新する。
-        列は空である前提。未反応メンバーは空文字を書き込む。
+        
+        [修正] 既存のセルに時刻情報（例: "遅刻(19:00～)"）が含まれており、
+        かつ新しいステータスと矛盾しない場合（例: "遅刻"）、
+        時刻情報を消さずにマージする。
         """
         with self._lock:
             self._refresh_index()
@@ -284,29 +287,76 @@ class GoogleSheetsManager:
 
             col = self._msgid_to_col[message_id]
             if not self._member_to_row:
-                # メンバー行が無ければ書くものが無い
                 return
 
             last_row = max(self._member_to_row.values())
             if last_row < _DATA_START_ROW:
                 return
 
-            # 列全体の配列を作る（未反応は空）
-            values: list[list[str]] = [
+            # 1. 現在の列の値を一括取得（時刻情報の保持用）
+            #    col_values は 0-index のリスト (row 1 is at index 0)
+            current_col_values = self.ws.col_values(col)
+
+            # 2. 書き込み用データの準備
+            #    (index 0 が _DATA_START_ROW に対応するように作る)
+            write_values: list[list[str]] = [
                 [""] for _ in range(_DATA_START_ROW, last_row + 1)
             ]
 
-            for member_id, status in values_by_member.items():
+            for member_id, new_status in values_by_member.items():
                 row = self._member_to_row.get(member_id)
                 if not row:
                     continue
+                
+                # 配列上のインデックス
                 idx = row - _DATA_START_ROW
-                if 0 <= idx < len(values):
-                    values[idx][0] = status
+                if not (0 <= idx < len(write_values)):
+                    continue
 
+                # --- マージロジック開始 ---
+                
+                # 既存セルの値を取得 (行が足りない場合は空文字)
+                old_val = ""
+                if (row - 1) < len(current_col_values):
+                    old_val = str(current_col_values[row - 1]).strip()
+
+                # 新しいステータスが「出席」「欠席」なら、時刻は関係ないのでそのまま上書き
+                if new_status in {"出席", "欠席"}:
+                    final_val = new_status
+                else:
+                    # 「遅刻」「早退」の場合、既存情報の維持を試みる
+                    # 例: Old="遅刻(19:00～) 早退", New="遅刻" -> "遅刻(19:00～)" を残したい
+                    # 例: Old="出席", New="遅刻" -> "遅刻" (時間はまだない)
+                    
+                    # 既存値をトークン分解 ("遅刻(xx)", "早退(xx)" を抽出)
+                    old_tokens = {}
+                    for tok in _TOKEN_RE.findall(old_val):
+                        if tok.startswith("遅刻"):
+                            old_tokens["遅刻"] = tok
+                        elif tok.startswith("早退"):
+                            old_tokens["早退"] = tok
+                    
+                    # 新しいステータス (例: "遅刻", "早退", "遅刻 早退") を分解して再構築
+                    new_parts = new_status.split()
+                    merged_parts = []
+                    for part in new_parts:
+                        if part in old_tokens:
+                            # 既存に詳細情報があればそれを採用 (例: "遅刻(19:00～)")
+                            merged_parts.append(old_tokens[part])
+                        else:
+                            # 無ければ新しい単純ステータスを採用 (例: "遅刻")
+                            merged_parts.append(part)
+                    
+                    final_val = " ".join(merged_parts)
+
+                # --- マージロジック終了 ---
+
+                write_values[idx][0] = final_val
+
+            # 3. 一括書き込み
             col_a1 = self._col_to_a1(col)
             rng = f"{col_a1}{_DATA_START_ROW}:{col_a1}{last_row}"
-            self.ws.update(rng, values)
+            self.ws.update(rng, write_values)
 
     # ------------------------------------------------------------------
     # private

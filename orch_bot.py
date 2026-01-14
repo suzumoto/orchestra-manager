@@ -180,26 +180,6 @@ def status_from_emoji(emoji_name: str) -> str | None:
 
 
 # ------------------------------------------------------------
-# yyyy-mm-dd → yyyy年mm月dd日(曜)
-# ------------------------------------------------------------
-def _format_japanese_date(date_iso: str) -> str:
-    """'YYYY-mm-dd' → 'YYYY年MM月DD日(曜)' に変換"""
-    dt = datetime.strptime(date_iso, "%Y-%m-%d")
-    weekday_jp = _WEEKDAYS_JP[dt.weekday()]  # 0=Mon
-    return f"{dt.year}年{dt.month:02d}月{dt.day:02d}日({weekday_jp})"
-
-
-# ------------------------------------------------------------
-# 年無し JP フォーマッタ
-# ------------------------------------------------------------
-def _format_japanese_date_short(date_iso: str) -> str:
-    """'YYYY-mm-dd' → 'MM月DD日(曜)' （年を含めない）"""
-    dt = datetime.strptime(date_iso, "%Y-%m-%d")
-    weekday_jp = _WEEKDAYS_JP[dt.weekday()]
-    return f"{dt.month:02d}月{dt.day:02d}日({weekday_jp})"
-
-
-# ------------------------------------------------------------
 # ユーティリティ群
 # ------------------------------------------------------------
 _TIME_RE = re.compile(r"^([01]?\d|2[0-3]):([0-5]\d)$")  # HH:MM 24h
@@ -400,48 +380,75 @@ _SYNC_DONE_ON_STARTUP = False
 # ============================================================
 async def _sync_latest_rsvp_in_guild(guild: discord.Guild) -> int:
     """
-    RSVPチャンネルの最新メッセージを取得し、
-    リアクション状況をSpreadSheetに一括同期する。
-    Returns: 同期したメッセージ(チャンネル)数
+    RSVPチャンネルの履歴(最新20件)から、1行目に日付がある投稿を同期する。
+    API制限回避のため、処理ごとに待機時間を設ける。
     """
     synced_count = 0
     
-    # 全てのRSVPチャンネル（全奏・分奏含む）を走査
+    # [追加] 現在日付(JST)を基準に過去ログ走査を止めるため
+    JST = timezone(timedelta(hours=9))
+    today = datetime.now(JST).date()
+
     for ch_name in RSVP_CHANNELS:
         channel = discord.utils.get(guild.text_channels, name=ch_name)
         if not channel:
             continue
 
-        # どのシートに対応するか判定
         sheet_key = _sheet_key_from_channel_name(ch_name)
         if not sheet_key:
             continue
         
-        # 対応するブリッジを取得
         bridge = _bridge_for_sheet_key(sheet_key)
+        print(f"--- Scanning channel: {ch_name} ---")
 
-        # 最新の1件だけを取得（これが最新の練習日程案内とみなす）
-        async for msg in channel.history(limit=1):
-            try:
-                date_iso = _extract_date_string(msg)
-                header_str = _format_japanese_date(date_iso)
-            except Exception:
+        # 最新20件を走査
+        async for msg in channel.history(limit=20):
+            # Bot自身の投稿や、システムメッセージは無視
+            if msg.author.bot:
                 continue
 
-            # 1. 列の確保
-            await bridge.add_event_column_async(header_str, msg.id)
+            # リアクションが付いていない投稿は無視（ただの連絡事項とみなす）
+            if len(msg.reactions) == 0:
+                continue
 
-            # 2. リアクション集計
-            values_by_member = await _collect_attendance_from_reactions(msg)
+            # ヘッダ候補と日付オブジェクトを取得
+            dt = _parse_date_from_msg(msg)
+            
+            # 過去の練習日だと判明したら、それより古いログも見なくていいので打ち切る
+            if dt and dt.date() < today:
+                print(f"    [SKIP] Found past event {dt.date()} (msg {msg.id}). Stopping history scan.")
+                break
 
-            # 3. シートへ一括反映
-            await bridge.bulk_update_status_column_async(
-                msg.id,
-                values_by_member,
-            )
-            synced_count += 1
-            print(f"Synced RSVP: {ch_name} ({sheet_key}) - {header_str}")
+            # ヘッダ文字列を生成 (dtがNoneなら投稿日から生成などよしなにやる)
+            header_str = _get_header_from_msg(msg)
+            
+            print(f"    Syncing msg {msg.id} -> Header: {header_str}")
 
+            try:
+                # 1. 列確保
+                await bridge.add_event_column_async(header_str, msg.id)
+
+                # 2. 集計
+                values_by_member = await _collect_attendance_from_reactions(msg)
+
+                # 3. 反映
+                await bridge.bulk_update_status_column_async(
+                    msg.id,
+                    values_by_member,
+                )
+                synced_count += 1
+                
+                # [修正] API制限(429 Quota exceeded)回避のため、1件処理するごとに5秒待機
+                print("        ...Waiting 5s for API limits...")
+                await asyncio.sleep(5.0)
+
+            except APIError as e:
+                # 万が一制限に達してもBotごと落ちないようにキャッチしてスキップ/待機
+                print(f"    ⚠️ API Error on msg {msg.id}: {e}")
+                print("    Waiting 30s before retrying next message...")
+                await asyncio.sleep(30.0)
+                continue
+            
     return synced_count
 
 # ============================================================
@@ -480,8 +487,8 @@ async def on_message(message: discord.Message) -> None:
                 await message.add_reaction(emoji)
 
         # まだ Sheets にメッセージ ID 未登録なら列を追加して登録
-        date_iso = _extract_date_string(message)
-        header_str = _format_japanese_date(date_iso)
+        # [変更] 新しいヘッダ生成ロジックを使用
+        header_str = _get_header_from_msg(message)
         sheet_key = _sheet_key_from_channel_name(ch_name)
         if sheet_key:
             bridge = _bridge_for_sheet_key(sheet_key)
@@ -588,8 +595,16 @@ async def on_raw_reaction_add(
 
         # ---- 遅刻／早退 → DM で時刻を問い合わせ ----
         if status in {"遅刻", "早退"}:
-            date_iso = _extract_date_string(await channel.fetch_message(message_id))
-            date_str_jp = _format_japanese_date_short(date_iso)
+            msg = await channel.fetch_message(message_id)
+            # [変更] 日付解析
+            dt = _parse_date_from_msg(msg)
+            # 日付不明なら投稿日で
+            if dt:
+                date_str_jp = f"{dt.month:02d}月{dt.day:02d}日" # 年なし
+            else:
+                jst = msg.created_at.replace(tzinfo=timezone.utc) + timedelta(hours=9)
+                date_str_jp = f"{jst.month:02d}月{jst.day:02d}日"
+
             await _send_time_prompt(
                 member=member,
                 server_message_id=message_id,
@@ -604,8 +619,8 @@ async def on_raw_reaction_add(
         msg = await channel.fetch_message(message_id)
 
         # 0) 列の追加（既存なら既存列番号が返るだけ）
-        date_iso = _extract_date_string(msg)
-        header_str = _format_japanese_date(date_iso)
+        # [変更] 新しいヘッダ生成ロジック
+        header_str = _get_header_from_msg(msg)
         await bridge.add_event_column_async(header_str, message_id)
 
         # 1) リアクションを集計して列一括更新（1 API call）
@@ -628,8 +643,18 @@ async def on_raw_reaction_add(
         return
 
     msg = await channel.fetch_message(message_id)
-    date_iso = _extract_date_string(msg)
-    date_str_jp = _format_japanese_date_short(date_iso)
+    
+    # [変更] 画像生成用の日付文字列も新ロジックから取得
+    # ここでは年を含まない短い形式が欲しいので _parse_date_from_msg を使う
+    dt = _parse_date_from_msg(msg)
+    if dt:
+        weekday_jp = _WEEKDAYS_JP[dt.weekday()]
+        date_str_jp = f"{dt.month:02d}月{dt.day:02d}日({weekday_jp})"
+    else:
+        # フォールバック
+        jst = msg.created_at.replace(tzinfo=timezone.utc) + timedelta(hours=9)
+        weekday_jp = _WEEKDAYS_JP[jst.weekday()]
+        date_str_jp = f"{jst.month:02d}月{jst.day:02d}日({weekday_jp})"
 
     out_ch: discord.TextChannel | None = None
     if send_mode == "channel":
@@ -843,57 +868,6 @@ async def _safe_fetch_member(
         return None
 
 
-async def _reflect_reactions_to_sheet(msg: discord.Message) -> None:
-    """
-    1. msg についている出欠リアクションをすべて走査
-    2. Spread Sheet に 1 件ずつ反映（直列）
-    3. 遅刻／早退は DM で時刻プロンプト
-    """
-    guild = msg.guild
-    if guild is None:
-        return
-
-    for reaction in msg.reactions:
-        emoji_name = _norm_emoji(getattr(reaction.emoji, "name", str(reaction.emoji)))
-        status = status_from_emoji(emoji_name)
-        if status is None:
-            continue  # 出欠系ではない
-
-        async for user in reaction.users():
-            if user.bot:
-                continue
-
-            member = await _safe_fetch_member(guild, user.id)
-            if member is None:
-                # 退室済みなどで取得不可
-                continue
-
-            # ------------- シート更新（直列で実行） -------------
-            try:
-                # どのシートかは msg.channel 名から判定
-                sheet_key = _sheet_key_from_channel_name(str(msg.channel))
-                if not sheet_key:
-                    continue
-                bridge = _bridge_for_sheet_key(sheet_key)
-                await bridge.update_status_async(msg.id, member.id, status)
-            except APIError as exc:
-                # ここで 429 が出ても次のユーザーへ進む
-                print(f"⚠️ Sheets API error while updating {member}: {exc}")
-                continue
-
-            # ------------- 遅刻／早退 → DM プロンプト -------------
-            if status in {"遅刻", "早退"}:
-                date_iso = _extract_date_string(msg)
-                date_jp = _format_japanese_date_short(date_iso)
-                await _send_time_prompt(
-                    member=member,
-                    server_message_id=msg.id,
-                    date_str_jp=date_jp,
-                    status=status,
-                    sheet_key=sheet_key,
-                )
-
-
 async def _collect_attendance_from_reactions(
     msg: discord.Message,
 ) -> dict[int, str]:
@@ -952,47 +926,91 @@ async def _collect_attendance_from_reactions(
 # 1) yyyy-mm-dd / yyyy/mm/dd
 # 2) mm-dd     / mm/dd
 # 3) mm月dd日
+# 4) mm月DD日 (未定)
 _DATE_RE_FULL = re.compile(r"(\d{4})[/-](\d{1,2})[/-](\d{1,2})")
 _DATE_RE_MD = re.compile(r"(\d{1,2})[/-](\d{1,2})")
 _DATE_RE_JP = re.compile(r"(\d{1,2})月(\d{1,2})日")
+_DATE_RE_JP_UNDECIDED = re.compile(r"(\d{1,2})月(?:DD|dd)日")
 
+# JST (UTC+9)
+JST = timezone(timedelta(hours=9))
 
-def _extract_date_string(msg: discord.Message) -> str:
-    """メッセージ本文から日付を探す。見つからなければ投稿日時を返す。"""
+def _parse_date_from_msg(msg: discord.Message) -> datetime | None:
+    """
+    メッセージから練習日の datetime オブジェクトを推定して返す。
+    年は「メッセージの投稿日時」を基準にする。
+    原則として「投稿日よりも過去の練習日はあり得ない」という前提で、
+    同年の日付が投稿日より過去になる場合は、翌年と判定する。
+    """
     text_first = msg.content.splitlines()[0] if msg.content else ""
+    text_first = text_first.strip()
+    
+    # 投稿日時（JST）
+    posted_at = msg.created_at.astimezone(JST)
+    posted_date = posted_at.date()
 
-    # --- yyyy-mm-dd 明示パターン ------------------------
+    # --- パターンA: yyyy-mm-dd (明示) ---
     m_full = _DATE_RE_FULL.search(text_first)
     if m_full:
         y, m, d = map(int, m_full.groups())
-        return f"{y:04d}-{m:02d}-{d:02d}"
+        return datetime(y, m, d).astimezone(JST)
 
-    # --- 年無し mm-dd / mm/dd --------------------------
+    # --- パターンB: 10月DD日 (未確定) ---
+    m_und = _DATE_RE_JP_UNDECIDED.search(text_first)
+    if m_und:
+        month = int(m_und.group(1))
+        year = posted_at.year
+        # 「投稿された月」よりも「指定月」が過去なら、翌年の話をしているとみなす
+        if month < posted_at.month:
+             year += 1
+        # 日付比較用に仮で1日を入れて返す
+        return datetime(year, month, 1).astimezone(JST)
+
+    # --- パターンC: mm-dd / mm月dd日 (年補完) ---
     for pat in (_DATE_RE_MD, _DATE_RE_JP):
         m = pat.search(text_first)
         if m:
             month, day = map(int, m.groups())
-            return _nearest_future_date(month, day)
+            
+            try:
+                # まず「投稿年」で日付を作ってみる
+                candidate = datetime(posted_at.year, month, day).astimezone(JST)
+            except ValueError:
+                continue # うるう年やありえない日付のガード
 
-    # --- 該当無し：投稿日時（JST） -----------------------
-    jst = msg.created_at.replace(tzinfo=timezone.utc) + timedelta(hours=9)
-    return jst.strftime("%Y-%m-%d")
+            # 作成した日付が「投稿日」より前なら、翌年の日付とする
+            if candidate.date() < posted_date:
+                try:
+                    candidate = candidate.replace(year=candidate.year + 1)
+                except ValueError:
+                    continue 
+
+            return candidate
+
+    return None
 
 
-def _nearest_future_date(month: int, day: int) -> str:
-    today = datetime.now(tz=timezone(timedelta(hours=9)))  # JST 現在
-    year = today.year
-    try:
-        candidate = datetime(year, month, day, tzinfo=today.tzinfo)
-    except ValueError:
-        # 無効日付はそのまま raise させる
-        raise
-
-    if candidate >= today:
-        return candidate.strftime("%Y-%m-%d")
-    # 今年は過ぎている → 翌年
-    candidate = datetime(year + 1, month, day, tzinfo=today.tzinfo)
-    return candidate.strftime("%Y-%m-%d")
+def _get_header_from_msg(msg: discord.Message) -> str:
+    """
+    SpreadSheetのヘッダ用文字列を生成する。
+    """
+    dt = _parse_date_from_msg(msg)
+    
+    # 日付解析不能だった場合: 投稿日時をそのまま使う
+    if dt is None:
+        jst = msg.created_at.astimezone(JST)
+        weekday_jp = _WEEKDAYS_JP[jst.weekday()]
+        return f"{jst.year}年{jst.month:02d}月{jst.day:02d}日({weekday_jp})"
+        
+    # 未定パターンかどうかの判定（ヘッダ文字列生成のため）
+    # dt は _parse_date_from_msg で年補完済みなので、その年を使う
+    text_first = msg.content.splitlines()[0] if msg.content else ""
+    if _DATE_RE_JP_UNDECIDED.search(text_first):
+         return f"{dt.year}年{dt.month:02d}月DD日(未定)"
+    
+    # 確定日付
+    weekday_jp = _WEEKDAYS_JP[dt.weekday()]
+    return f"{dt.year}年{dt.month:02d}月{dt.day:02d}日({weekday_jp})"
 
 
 # ============================================================
