@@ -23,6 +23,64 @@ def _base_status(cell: str) -> str:
     return "未回答"
 
 
+def _extract_late_leave_tokens(text: str) -> Dict[str, str]:
+    """
+    セル文字列から「遅刻」「早退」のトークンだけを抜き出す。
+
+    入力
+    ----
+    text : str
+        セルの生文字列（例: "遅刻(19:00～) 早退"）
+
+    出力
+    ----
+    dict[str, str]
+        キーは '遅刻' '早退'。値は時刻付きの元トークン
+        （例: {'遅刻': '遅刻(19:00～)'}）。無ければキー自体が存在しない。
+    """
+    tokens: Dict[str, str] = {}
+    for tok in _TOKEN_RE.findall(text):
+        if tok.startswith("遅刻"):
+            tokens["遅刻"] = tok.strip()
+        elif tok.startswith("早退"):
+            tokens["早退"] = tok.strip()
+    return tokens
+
+
+def _merge_status_with_existing(old_val: str, new_status: str) -> str:
+    """
+    出欠セルの新ステータスを、既存セルの時刻情報を保持しつつマージする。
+
+    入力
+    ----
+    old_val : str
+        更新前のセル文字列（例: "遅刻(19:00～) 早退"）
+    new_status : str
+        新しいステータス文字列（例: "遅刻" '出席' '遅刻 早退'）
+        時刻無しの単純な状態名を想定（複数は空白区切り）。
+
+    出力
+    ----
+    str
+        書き込むべきセル文字列。
+        例: Old="遅刻(19:00～) 早退", New="遅刻" -> "遅刻(19:00～)"
+        例: Old="出席", New="遅刻" -> "遅刻"（時刻情報はまだ無い）
+
+    仕様
+    ----
+    - 新ステータスが「出席」「欠席」なら時刻は関係ないのでそのまま上書き。
+    - 「遅刻」「早退」の場合、既存セルに同種の時刻付きトークンがあれば
+      それを優先して残す。無ければ単純な新ステータス文字列を採用する。
+    """
+    if new_status in {"出席", "欠席"}:
+        return new_status
+
+    old_tokens = _extract_late_leave_tokens(old_val)
+    new_parts = new_status.split()
+    merged_parts = [old_tokens.get(part, part) for part in new_parts]
+    return " ".join(merged_parts)
+
+
 class CellOccupiedError(Exception):
     """Spread Sheetへの書き込み時に、上書きが必要な時に送出"""
     def __init__(
@@ -45,13 +103,6 @@ class CellOccupiedError(Exception):
             f"{new_part}-{new_num}"
         )
 
-
-_EMOJI_TO_STATUS = {
-    "shusseki": "出席",
-    "kesseki": "欠席",
-    "chikoku": "遅刻",
-    "soutai": "早退",
-}
 
 # 1 行目 … ヘッダ（Part / Num / … / <日付> / <日付> / …）
 # 2 行目 … メッセージ ID を格納
@@ -82,6 +133,25 @@ class GoogleSheetsManager:
         credential_json: str = "credentials.json",
         programs: List[str] | None = None,
     ) -> None:
+        """
+        Google Spread Sheet に接続し、ヘッダ行が無ければ作成する。
+
+        入力
+        ----
+        spreadsheet_id : str
+            対象 Spread Sheet の ID
+        worksheet_name : str
+            対象ワークシート名（例: '全奏'）
+        credential_json : str
+            サービスアカウントの認証情報 JSON へのパス
+        programs : list[str] | None
+            プログラム名一覧（ヘッダの "{prog}_パート" 列生成に使う）
+
+        出力
+        ----
+        なし（インスタンス初期化。gspread クライアント接続と
+        内部インデックス構築を行う）
+        """
         scopes = [
             "https://www.googleapis.com/auth/spreadsheets",
             "https://www.googleapis.com/auth/drive.readonly",
@@ -135,44 +205,49 @@ class GoogleSheetsManager:
             self._build_index()
             return new_col
 
-    def update_status(  # noqa: C901, PLR0915
+    def registered_member_ids(self) -> set[int]:
+        """シートに登録されている全メンバーの Discord ID を返す"""
+        with self._lock:
+            self._refresh_index()
+            return set(self._member_to_row.keys())
+
+    def update_status(
         self,
         message_id: int,
         member_id: int,
         status_name: str,
     ) -> None:
         """
-        期待仕様
-        --------
+        1 人・1 練習日分の出欠セルを更新する（DM の時刻返信などから呼ばれる）。
+
+        入力
+        ----
+        message_id : int
+            RSVP 投稿の Discord メッセージ ID（列を特定するキー）
+        member_id : int
+            更新対象メンバーの Discord ID（行を特定するキー）
+        status_name : str
+            書き込みたいステータス文字列
+            （例: '出席' '欠席' '遅刻(19:00～)' '早退(～20:00)'）
+
+        出力
+        ----
+        なし（Spread Sheet のセルを直接更新する）
+
+        仕様
+        ----
         1. 出席／欠席が来たらそれ 1 個だけをセルに残す。
         2. 遅刻／早退は同時に 1 個ずつまで残す。
            - 同じ種類を押し直したら置き換え
            - 片方だけ来た場合は既存のもう一方を温存
         """
-
-        def _tokenize(text: str) -> Dict[str, str]:
-            """
-            セル文字列を基本 4 ステータス単位で分解。
-            戻り値キーは『出席』『欠席』『遅刻』『早退』
-            値は元文字列（括弧付きの場合も含む）。
-            """
-            mapping: Dict[str, str] = {}
-            for tok in _TOKEN_RE.findall(text):
-                if tok.startswith("遅刻"):
-                    mapping["遅刻"] = tok.strip()
-                elif tok.startswith("早退"):
-                    mapping["早退"] = tok.strip()
-                else:
-                    mapping[tok] = tok.strip()
-            return mapping
-
         # -------- 行・列の特定 --------------------------------
         self._refresh_index()  # ← Lock とインデックス再構築
         col = self._msgid_to_col[message_id]
         row = self._member_to_row[member_id]
 
         current_raw = self.ws.cell(row, col).value or ""
-        cur_map = _tokenize(current_raw)
+        late_leave_tokens = _extract_late_leave_tokens(current_raw)
 
         # -------- 新ステータスを反映 ----------------------------
         base = (
@@ -186,13 +261,13 @@ class GoogleSheetsManager:
             new_val = base
         else:
             # 2. 遅刻／早退は共存可
-            cur_map[base] = status_name.strip()  # 置き換え or 挿入
+            late_leave_tokens[base] = status_name.strip()  # 置き換え or 挿入
             # 片方だけ残っているかもしれないので順序を固定化
             parts = []
-            if "遅刻" in cur_map:
-                parts.append(cur_map["遅刻"])
-            if "早退" in cur_map:
-                parts.append(cur_map["早退"])
+            if "遅刻" in late_leave_tokens:
+                parts.append(late_leave_tokens["遅刻"])
+            if "早退" in late_leave_tokens:
+                parts.append(late_leave_tokens["早退"])
             new_val = " ".join(parts).strip()
 
         # -------- シートへ書き込み ------------------------------
@@ -207,8 +282,20 @@ class GoogleSheetsManager:
         program: str,
     ) -> Dict[Tuple[str, int, str], str]:
         """
-        {(part, num, name): status_raw}
-        num がシートに無い場合は 0
+        1 練習日・1 プログラム分の出欠状況をまとめて取得する（draw.py 用）。
+
+        入力
+        ----
+        message_id : int
+            対象の練習日を特定する Discord メッセージ ID
+        program : str
+            対象プログラム名（例: '前'）
+
+        出力
+        ----
+        dict[(str, int, str), str]
+            {(part, num, name): status_raw} の辞書。
+            num がシートに無い場合は 0、status_raw が空欄なら '未回答'。
         """
         with self._lock:
             self._refresh_index()
@@ -257,6 +344,18 @@ class GoogleSheetsManager:
     # 複数行をまとめて追加
     # ------------------------------------------------------
     def append_rows_bulk(self, rows: List[List[str]]) -> None:
+        """
+        複数メンバー分の行を一括追加する。
+
+        入力
+        ----
+        rows : list[list[str]]
+            _default_headers() の列順に揃えた行データのリスト
+
+        出力
+        ----
+        なし（rows が空なら何もしない）
+        """
         if not rows:
             return
         with self._lock:
@@ -272,11 +371,24 @@ class GoogleSheetsManager:
     ) -> None:
         """
         出欠列（message_id に対応する列）に対し、Discord ID → ステータスの
-        マッピングを列全体として一括更新する。
-        
-        [修正] 既存のセルに時刻情報（例: "遅刻(19:00～)"）が含まれており、
-        かつ新しいステータスと矛盾しない場合（例: "遅刻"）、
-        時刻情報を消さずにマージする。
+        マッピングを列全体として一括更新する（API 呼び出し 1 回）。
+
+        入力
+        ----
+        message_id : int
+            対象の練習日を特定する Discord メッセージ ID
+        values_by_member : dict[int, str]
+            {Discord ID: 新ステータス文字列('出席'/'欠席'/'遅刻'/'早退'/'遅刻 早退')}
+
+        出力
+        ----
+        なし（列全体を一括で書き換える）
+
+        注意
+        ----
+        既存セルに時刻情報（例: "遅刻(19:00～)"）が含まれており、かつ
+        新しいステータスと矛盾しない場合は、時刻情報を消さずにマージする
+        （マージ本体は _merge_status_with_existing に切り出し）。
         """
         with self._lock:
             self._refresh_index()
@@ -293,70 +405,62 @@ class GoogleSheetsManager:
             if last_row < _DATA_START_ROW:
                 return
 
-            # 1. 現在の列の値を一括取得（時刻情報の保持用）
-            #    col_values は 0-index のリスト (row 1 is at index 0)
+            # 現在の列の値を一括取得（時刻情報の保持用）
+            # col_values は 0-index のリスト (row 1 が index 0)
             current_col_values = self.ws.col_values(col)
 
-            # 2. 書き込み用データの準備
-            #    (index 0 が _DATA_START_ROW に対応するように作る)
-            write_values: list[list[str]] = [
-                [""] for _ in range(_DATA_START_ROW, last_row + 1)
-            ]
+            write_values = self._build_status_column_values(
+                last_row, values_by_member, current_col_values
+            )
 
-            for member_id, new_status in values_by_member.items():
-                row = self._member_to_row.get(member_id)
-                if not row:
-                    continue
-                
-                # 配列上のインデックス
-                idx = row - _DATA_START_ROW
-                if not (0 <= idx < len(write_values)):
-                    continue
-
-                # --- マージロジック開始 ---
-                
-                # 既存セルの値を取得 (行が足りない場合は空文字)
-                old_val = ""
-                if (row - 1) < len(current_col_values):
-                    old_val = str(current_col_values[row - 1]).strip()
-
-                # 新しいステータスが「出席」「欠席」なら、時刻は関係ないのでそのまま上書き
-                if new_status in {"出席", "欠席"}:
-                    final_val = new_status
-                else:
-                    # 「遅刻」「早退」の場合、既存情報の維持を試みる
-                    # 例: Old="遅刻(19:00～) 早退", New="遅刻" -> "遅刻(19:00～)" を残したい
-                    # 例: Old="出席", New="遅刻" -> "遅刻" (時間はまだない)
-                    
-                    # 既存値をトークン分解 ("遅刻(xx)", "早退(xx)" を抽出)
-                    old_tokens = {}
-                    for tok in _TOKEN_RE.findall(old_val):
-                        if tok.startswith("遅刻"):
-                            old_tokens["遅刻"] = tok
-                        elif tok.startswith("早退"):
-                            old_tokens["早退"] = tok
-                    
-                    # 新しいステータス (例: "遅刻", "早退", "遅刻 早退") を分解して再構築
-                    new_parts = new_status.split()
-                    merged_parts = []
-                    for part in new_parts:
-                        if part in old_tokens:
-                            # 既存に詳細情報があればそれを採用 (例: "遅刻(19:00～)")
-                            merged_parts.append(old_tokens[part])
-                        else:
-                            # 無ければ新しい単純ステータスを採用 (例: "遅刻")
-                            merged_parts.append(part)
-                    
-                    final_val = " ".join(merged_parts)
-
-                # --- マージロジック終了 ---
-
-                write_values[idx][0] = final_val
-
-            # 3. 一括書き込み
             col_a1 = self._col_to_a1(col)
             rng = f"{col_a1}{_DATA_START_ROW}:{col_a1}{last_row}"
             self.ws.update(rng, write_values)
+
+    def _build_status_column_values(
+        self,
+        last_row: int,
+        values_by_member: Dict[int, str],
+        current_col_values: List[str],
+    ) -> List[List[str]]:
+        """
+        bulk_update_status_column 用：書き込む列データ（2 次元配列）を組み立てる。
+
+        入力
+        ----
+        last_row : int
+            対象範囲の最終行番号
+        values_by_member : dict[int, str]
+            {Discord ID: 新ステータス文字列}
+        current_col_values : list[str]
+            更新前の列の値（ws.col_values の戻り値そのまま、0-index）
+
+        出力
+        ----
+        list[list[str]]
+            _DATA_START_ROW 行目から last_row 行目までの、更新後のセル値
+            （gspread の update() にそのまま渡せる形）
+        """
+        write_values: List[List[str]] = [
+            [""] for _ in range(_DATA_START_ROW, last_row + 1)
+        ]
+
+        for member_id, new_status in values_by_member.items():
+            row = self._member_to_row.get(member_id)
+            if not row:
+                continue
+
+            idx = row - _DATA_START_ROW
+            if not (0 <= idx < len(write_values)):
+                continue
+
+            old_val = ""
+            if (row - 1) < len(current_col_values):
+                old_val = str(current_col_values[row - 1]).strip()
+
+            write_values[idx][0] = _merge_status_with_existing(old_val, new_status)
+
+        return write_values
 
     # ------------------------------------------------------------------
     # private
@@ -391,6 +495,20 @@ class GoogleSheetsManager:
     # 行・列インデックスを構築
     # ----------------------------------------------------------
     def _build_index(self) -> None:
+        """
+        シート内容から 3 種類の検索用インデックスを作り直す。
+
+        入力
+        ----
+        なし（self.ws の現在の内容を読む）
+
+        出力
+        ----
+        なし。以下を self に設定する:
+        - _col_to_header : {列番号: ヘッダ文字列}
+        - _msgid_to_col : {Discord メッセージ ID: 列番号}
+        - _member_to_row : {Discord ID: 行番号}
+        """
         header = self.ws.row_values(_HEADER_DATE_ROW)
         msg_ids = self.ws.row_values(_MESSAGE_ID_ROW)
 
@@ -463,9 +581,33 @@ class GoogleSheetsManager:
         overwrite: bool = False,
     ) -> None:
         """
+        乗り番（パート・席次）を 1 人分 Spread Sheet に登録・更新する。
+
+        入力
+        ----
+        program : str
+            対象プログラム名（例: '前'）
+        part, num : str, int
+            登録するパートと席次
+        display_name : str
+            Discord 表示名（該当行の discord表示名 列に無条件で反映）
+        member_id : int
+            Discord ID（行の特定キー）
+        overwrite : bool, keyword-only
+            既存値と衝突するときに上書きしてよいか
+
+        出力
+        ----
+        なし。ただし既存値と衝突していて overwrite=False の場合は
+        CellOccupiedError を送出する（呼び出し側で確認ダイアログを出す想定）。
+
+        仕様
+        ----
         ・discord表示名 は常に最新に上書き
         ・パート／席次に既存値があり、かつ値が変わる場合は
           overwrite=False なら CellOccupiedError を送出
+        ・初回登録（欄が空）の場合は衝突ではないので、overwrite の値に
+          関わらず常に書き込む
         """
         with self._lock:
             self._refresh_index()
@@ -486,19 +628,19 @@ class GoogleSheetsManager:
                 prev_part = self.ws.cell(row, part_col).value or ""
                 prev_num = self.ws.cell(row, num_col).value or ""
 
-                need_overwrite = (
-                    (prev_part and prev_part != part)
-                    or (prev_num and prev_num != str(num))
+                has_existing_value = bool(prev_part) or bool(prev_num)
+                conflicts = has_existing_value and (
+                    prev_part != part or prev_num != str(num)
                 )
 
-                if need_overwrite and not overwrite:
+                if conflicts and not overwrite:
                     raise CellOccupiedError(
                         row, program, prev_part, prev_num, part, num
                     )
 
-                if need_overwrite or overwrite:
-                    self.ws.update_cell(row, part_col, part)
-                    self.ws.update_cell(row, num_col, str(num))
+                # 初回登録（空欄）・衝突なし・overwrite指定のいずれでも書き込む
+                self.ws.update_cell(row, part_col, part)
+                self.ws.update_cell(row, num_col, str(num))
 
                 self._build_index()
                 return
@@ -519,7 +661,11 @@ class GoogleSheetsManager:
 # 非同期ラッパ（discord.py から呼びやすくする）
 # ------------------------------------------------------------
 class SheetAsyncBridge:
-    """同期 gspread 呼び出しを asyncio から使いやすく包む"""
+    """
+    同期 gspread 呼び出しを asyncio から使いやすく包むブリッジ。
+    各 *_async メソッドは対応する GoogleSheetsManager の同名メソッドを
+    別スレッドで実行するだけで、入力・出力・仕様は元メソッドと同一。
+    """
 
     def __init__(self, gs: GoogleSheetsManager) -> None:
         self.gs = gs
@@ -530,6 +676,7 @@ class SheetAsyncBridge:
         member_id: int,
         status_name: str,
     ) -> None:
+        """GoogleSheetsManager.update_status を別スレッドで実行する"""
         await asyncio.to_thread(
             self.gs.update_status, message_id, member_id, status_name
         )
@@ -539,6 +686,7 @@ class SheetAsyncBridge:
         message_id: int,
         program: str,
     ) -> Dict[Tuple[str, int, str], str]:
+        """GoogleSheetsManager.attendance_dict を別スレッドで実行する"""
         return await asyncio.to_thread(
             self.gs.attendance_dict, message_id, program
         )
@@ -548,6 +696,7 @@ class SheetAsyncBridge:
         header_str: str,
         message_id: int,
     ) -> int:
+        """GoogleSheetsManager.add_event_column を別スレッドで実行する"""
         return await asyncio.to_thread(
             self.gs.add_event_column, header_str, message_id
         )
@@ -562,6 +711,7 @@ class SheetAsyncBridge:
         *,
         overwrite: bool = False,
     ) -> None:
+        """GoogleSheetsManager.append_member を別スレッドで実行する"""
         await asyncio.to_thread(
             self.gs.append_member,
             program,
@@ -577,8 +727,13 @@ class SheetAsyncBridge:
         message_id: int,
         values_by_member: Dict[int, str],
     ) -> None:
+        """GoogleSheetsManager.bulk_update_status_column を別スレッドで実行する"""
         await asyncio.to_thread(
             self.gs.bulk_update_status_column,
             message_id,
             values_by_member,
         )
+
+    async def registered_member_ids_async(self) -> set[int]:
+        """GoogleSheetsManager.registered_member_ids を別スレッドで実行する"""
+        return await asyncio.to_thread(self.gs.registered_member_ids)
