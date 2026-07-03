@@ -24,7 +24,18 @@ CANVAS_SIZE = (1920, 1080)
 class PlayerBoxDrawer:
     def __init__(self, seat_layout, background_color=WHITE):
         """
-        seat_layout : SeatLayoutSlides インスタンス
+        座席図キャンバスを作成し、ロゴ・凡例・指揮者ボックスを先に描画する。
+
+        入力
+        ----
+        seat_layout : SeatLayoutSlides
+            座席・凡例・ロゴ枠などの位置情報を持つオブジェクト
+        background_color : tuple[int, int, int]
+            キャンバスの背景色（デフォルト白）
+
+        出力
+        ----
+        なし（self.img に描画済みの画像を保持する）
         """
         self.seat_layout = seat_layout
         self.img = Image.new("RGB", CANVAS_SIZE, background_color)
@@ -41,21 +52,27 @@ class PlayerBoxDrawer:
                        name: str,
                        fill_color: Tuple[int, int, int],
                        font_color: Tuple[int, int, int]) -> None:
-        key = self._resolve_seat_key(part, num)
+        """
+        単色 1 枠の座席 BOX を描画する（出席/欠席など単一状態向け）。
 
-        info = self.seat_layout.seats[key]
-        cx, cy = info["center"]
-        w,  h = info["size"]
+        入力
+        ----
+        part, num : str, int
+            座席を特定するパート名と席次（Slides 側の座席キーに対応）
+        name : str
+            BOX に表示する奏者名
+        fill_color, font_color : tuple[int, int, int]
+            塗りつぶし色・文字色
 
-        ul = (cx - w / 2, cy - h / 2)
-        lr = (cx + w / 2, cy + h / 2)
+        出力
+        ----
+        なし（self.img に直接描画する）
+        """
+        cx, cy, w, h, ul, lr = self._seat_geometry(part, num)
 
         self.draw.rectangle((ul, lr), fill=fill_color,
                             outline=BLACK, width=2)
-        self.draw.text((cx, cy - h * 0.25), part,
-                       font=PART_FONT, fill=font_color, anchor="mm")
-        self.draw.text((cx, cy + h * 0.25), name,
-                       font=NAME_FONT, fill=font_color, anchor="mm")
+        self._draw_seat_text(cx, cy, h, part, name, font_color)
 
     # -------------------------------------------------
     # 左右 2 色分割 BOX を描く
@@ -69,14 +86,25 @@ class PlayerBoxDrawer:
         fill_right: tuple[int, int, int],
         font_color: tuple[int, int, int] = BLACK,
     ) -> None:
-        key = self._resolve_seat_key(part, num)
+        """
+        左右 2 色に塗り分けた座席 BOX を描画する（遅刻+早退の併記など）。
 
-        info = self.seat_layout.seats[key]
-        cx, cy = info["center"]
-        w, h = info["size"]
+        入力
+        ----
+        part, num : str, int
+            座席を特定するパート名と席次
+        name : str
+            BOX に表示する奏者名
+        fill_left, fill_right : tuple[int, int, int]
+            左半分・右半分の塗りつぶし色
+        font_color : tuple[int, int, int]
+            文字色
 
-        ul = (cx - w / 2, cy - h / 2)
-        lr = (cx + w / 2, cy + h / 2)
+        出力
+        ----
+        なし（self.img に直接描画する）
+        """
+        cx, cy, w, h, ul, lr = self._seat_geometry(part, num)
         mid_x = cx
 
         # 1) 左右を塗り分け（枠を描かず fill のみ）
@@ -86,21 +114,60 @@ class PlayerBoxDrawer:
         # 2) 外枠を最後に描画  ← これで 1 色 BOX とまったく同じ見た目
         self.draw.rectangle((ul, lr), outline=BLACK, width=2)
 
-        # 3) テキスト
-        self.draw.text(
-            (cx, cy - h * 0.25),
-            part,
-            font=PART_FONT,
-            fill=font_color,
-            anchor="mm",
-        )
-        self.draw.text(
-            (cx, cy + h * 0.25),
-            name,
-            font=NAME_FONT,
-            fill=font_color,
-            anchor="mm",
-        )
+        self._draw_seat_text(cx, cy, h, part, name, font_color)
+
+    def _seat_geometry(
+        self, part: str, num: int
+    ) -> tuple[float, float, float, float, tuple[float, float], tuple[float, float]]:
+        """
+        座席の中心座標・サイズ・矩形の左上/右下座標をまとめて求める。
+
+        入力
+        ----
+        part, num : str, int
+            座席を特定するパート名と席次
+
+        出力
+        ----
+        (cx, cy, w, h, upper_left, lower_right)
+        """
+        key = self._resolve_seat_key(part, num)
+        info = self.seat_layout.seats[key]
+        cx, cy = info["center"]
+        w, h = info["size"]
+        ul = (cx - w / 2, cy - h / 2)
+        lr = (cx + w / 2, cy + h / 2)
+        return cx, cy, w, h, ul, lr
+
+    def _draw_seat_text(
+        self,
+        cx: float,
+        cy: float,
+        h: float,
+        part: str,
+        name: str,
+        font_color: Tuple[int, int, int],
+    ) -> None:
+        """
+        座席 BOX 内に「パート名（上段）」「奏者名（下段）」を描画する。
+
+        入力
+        ----
+        cx, cy, h : float
+            BOX の中心座標と高さ（テキスト位置の計算に使う）
+        part, name : str
+            表示するパート名・奏者名
+        font_color : tuple[int, int, int]
+            文字色
+
+        出力
+        ----
+        なし（self.draw に直接描画する）
+        """
+        self.draw.text((cx, cy - h * 0.25), part,
+                       font=PART_FONT, fill=font_color, anchor="mm")
+        self.draw.text((cx, cy + h * 0.25), name,
+                       font=NAME_FONT, fill=font_color, anchor="mm")
 
     # -------------------------------------------------
     # 日付とプログラム名を描画
@@ -138,6 +205,18 @@ class PlayerBoxDrawer:
     # ファイル保存
     # -------------------------------------------------
     def save(self, filepath: str | Path) -> None:
+        """
+        描画済み画像をファイルに保存する（親ディレクトリが無ければ作成）。
+
+        入力
+        ----
+        filepath : str | Path
+            保存先パス
+
+        出力
+        ----
+        なし
+        """
         Path(filepath).parent.mkdir(parents=True, exist_ok=True)
         self.img.save(filepath)
 

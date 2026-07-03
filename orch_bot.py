@@ -6,9 +6,9 @@ import asyncio
 import re
 import json
 from pathlib import Path
-from datetime import timezone, timedelta, datetime
+from datetime import timezone, timedelta, datetime, date, time as dtime
 import discord
-from discord.ext import commands
+from discord.ext import commands, tasks
 from gspread.exceptions import GSpreadException
 from gspread.exceptions import APIError
 
@@ -78,6 +78,23 @@ CHECKMARK_EMOJI = "✅"
 CANCEL_EMOJI = "🆖"
 _WEEKDAYS_JP = "月火水木金土日"
 
+# JST (UTC+9)
+JST = timezone(timedelta(hours=9))
+
+# ---------------- リマインダー設定 -------------------------
+def _parse_hhmm(s: str) -> dtime:
+    h, m = s.strip().split(":")
+    return dtime(int(h), int(m), tzinfo=JST)
+
+_rem_cfg = config["REMINDER"] if "REMINDER" in config else {}
+REMIND_DAYS_BEFORE = [
+    int(x) for x in _rem_cfg.get("remind_days_before", "3,1").split(",")
+]
+REMIND_TIME = _parse_hhmm(_rem_cfg.get("remind_time", "19:00"))
+OUTPUT_TIME = _parse_hhmm(_rem_cfg.get("output_time", "07:00"))
+REMINDER_MENTION_ROLE = _rem_cfg.get("mention_role", "運営")
+REMINDER_SCAN_LIMIT = int(_rem_cfg.get("scan_limit", "30"))
+
 # ---------------- Sheets / Slides ---------------------------
 SPREADSHEET_ID = os.getenv("SPREADSHEET_ID")
 if not SPREADSHEET_ID:
@@ -85,7 +102,7 @@ if not SPREADSHEET_ID:
 
 # シート名の設定（デフォルト: 全奏 / 分奏）
 ENSOU_SHEET_NAME = config["SPREADSHEET"].get(
-    "ensou_worksheet_name",
+    "zensou_worksheet_name",
     config["SPREADSHEET"].get("worksheet_name", "全奏"),
 )
 BUNSOU_SHEET_NAME = config["SPREADSHEET"].get("bunsou_worksheet_name", "分奏")
@@ -191,6 +208,7 @@ def _norm_emoji(txt: str) -> str:
 
 
 def _valid_time(text: str) -> bool:
+    """入力文字列が HH:MM (24時間制) 形式かどうかを判定する"""
     return bool(_TIME_RE.match(text.strip()))
 
 
@@ -229,6 +247,27 @@ async def _send_time_prompt(
     status: str,
     sheet_key: str,
 ) -> None:
+    """
+    遅刻／早退した member に DM で時刻の入力を促し、返信を追跡できるよう
+    プロンプトのコンテキストを保存する。
+
+    入力
+    ----
+    member : discord.Member
+        DM の送信先
+    server_message_id : int
+        元の RSVP メッセージ ID（返信が来た時に Sheets を更新するため）
+    date_str_jp : str
+        DM 文面に使う日付文字列（例: '07月31日'）
+    status : str
+        '遅刻' または '早退'
+    sheet_key : str
+        書き込み先シートの選択キー
+
+    出力
+    ----
+    なし（DM 送信 + _PROMPT_CONTEXT への記録・永続化を行う）
+    """
     dm = await member.create_dm()
     verb = "到着" if status == "遅刻" else "退出"
     prompt = (
@@ -293,36 +332,6 @@ def _detect_part_from_roles(member: discord.Member) -> str | None:
 
 
 # ============================================================
-# 同期用：行 Upsert ユーティリティ（同期関数）
-# ============================================================
-def _insert_member_row_if_absent(
-    gs: GoogleSheetsManager,
-    member: discord.Member,
-    part: str | None,
-) -> bool:
-    """
-    Discord ID が未登録なら新規行を追加して True を返す。
-    既に存在していれば何もせず False。
-    """
-    if member.id in gs._member_to_row:
-        return False
-
-    part = _canon_part(part)
-
-    heads = _default_headers(gs.programs)
-    new_row = [""] * len(heads)
-    new_row[heads.index("discord表示名")] = member.display_name
-    new_row[heads.index("氏名")] = ""
-    new_row[heads.index("Discord ID")] = str(member.id)
-    if part:
-        for prog in gs.programs:
-            new_row[heads.index(f"{prog}_パート")] = part
-    gs.append_rows_bulk([new_row])
-    gs._build_index()
-    return True
-
-
-# ============================================================
 # ギルドメンバー → SpreadSheet 同期（全奏のみ）
 # ============================================================
 async def _sync_members_to_sheet(
@@ -375,17 +384,85 @@ _PROMPT_CONTEXT: dict[int, tuple[int, str, str]] = _load_prompt_context()
 # ============================================================
 _SYNC_DONE_ON_STARTUP = False
 
-# ============================================================
-# [追加] 同期用: 最新RSVPメッセージの状態をシートへ強制同期
-# ============================================================
+# 1 メッセージの同期処理結果を表す 3 状態
+_SYNC_STOP = "stop"      # これより古い投稿はもう見なくてよい
+_SYNC_SYNCED = "synced"  # シートへの反映が完了した
+_SYNC_SKIP = "skip"      # 対象外だった、またはエラーで今回はスキップ
+
+
+async def _sync_message_if_recent(
+    msg: discord.Message,
+    bridge: SheetAsyncBridge,
+    today: date,
+) -> str:
+    """
+    1 件の RSVP 投稿を判定し、必要ならシートへ同期する。
+
+    入力
+    ----
+    msg : discord.Message
+        判定対象の投稿（RSVP チャンネルの履歴から 1 件）
+    bridge : SheetAsyncBridge
+        書き込み先シート
+    today : date
+        JST での「今日」の日付（過去投稿の判定基準）
+
+    出力
+    ----
+    str
+        _SYNC_STOP  : この投稿が過去の練習日だった
+                      （呼び出し側はこれより古い履歴の走査を打ち切ってよい）
+        _SYNC_SYNCED: シートへの反映が完了した
+        _SYNC_SKIP  : Bot 投稿／リアクション無し／API エラーで今回は何もしなかった
+    """
+    if msg.author.bot:
+        return _SYNC_SKIP
+
+    if len(msg.reactions) == 0:  # ただの連絡事項とみなす
+        return _SYNC_SKIP
+
+    dt = _parse_date_from_msg(msg)
+    if dt and dt.date() < today:
+        print(f"    [SKIP] Found past event {dt.date()} (msg {msg.id}). Stopping history scan.")
+        return _SYNC_STOP
+
+    header_str = _get_header_from_msg(msg)
+    print(f"    Syncing msg {msg.id} -> Header: {header_str}")
+
+    try:
+        await bridge.add_event_column_async(header_str, msg.id)
+        values_by_member = await _collect_attendance_from_reactions(msg)
+        await bridge.bulk_update_status_column_async(msg.id, values_by_member)
+
+        # API制限(429 Quota exceeded)回避のため、1件処理するごとに5秒待機
+        print("        ...Waiting 5s for API limits...")
+        await asyncio.sleep(5.0)
+        return _SYNC_SYNCED
+
+    except APIError as e:
+        # 万が一制限に達してもBotごと落ちないようにキャッチしてスキップ/待機
+        print(f"    ⚠️ API Error on msg {msg.id}: {e}")
+        print("    Waiting 30s before retrying next message...")
+        await asyncio.sleep(30.0)
+        return _SYNC_SKIP
+
+
 async def _sync_latest_rsvp_in_guild(guild: discord.Guild) -> int:
     """
     RSVPチャンネルの履歴(最新20件)から、1行目に日付がある投稿を同期する。
-    API制限回避のため、処理ごとに待機時間を設ける。
+
+    入力
+    ----
+    guild : discord.Guild
+        走査対象のギルド
+
+    出力
+    ----
+    int
+        シートへ反映した投稿の件数
     """
     synced_count = 0
-    
-    # [追加] 現在日付(JST)を基準に過去ログ走査を止めるため
+
     JST = timezone(timedelta(hours=9))
     today = datetime.now(JST).date()
 
@@ -397,58 +474,17 @@ async def _sync_latest_rsvp_in_guild(guild: discord.Guild) -> int:
         sheet_key = _sheet_key_from_channel_name(ch_name)
         if not sheet_key:
             continue
-        
+
         bridge = _bridge_for_sheet_key(sheet_key)
         print(f"--- Scanning channel: {ch_name} ---")
 
-        # 最新20件を走査
         async for msg in channel.history(limit=20):
-            # Bot自身の投稿や、システムメッセージは無視
-            if msg.author.bot:
-                continue
-
-            # リアクションが付いていない投稿は無視（ただの連絡事項とみなす）
-            if len(msg.reactions) == 0:
-                continue
-
-            # ヘッダ候補と日付オブジェクトを取得
-            dt = _parse_date_from_msg(msg)
-            
-            # 過去の練習日だと判明したら、それより古いログも見なくていいので打ち切る
-            if dt and dt.date() < today:
-                print(f"    [SKIP] Found past event {dt.date()} (msg {msg.id}). Stopping history scan.")
+            result = await _sync_message_if_recent(msg, bridge, today)
+            if result == _SYNC_STOP:
                 break
-
-            # ヘッダ文字列を生成 (dtがNoneなら投稿日から生成などよしなにやる)
-            header_str = _get_header_from_msg(msg)
-            
-            print(f"    Syncing msg {msg.id} -> Header: {header_str}")
-
-            try:
-                # 1. 列確保
-                await bridge.add_event_column_async(header_str, msg.id)
-
-                # 2. 集計
-                values_by_member = await _collect_attendance_from_reactions(msg)
-
-                # 3. 反映
-                await bridge.bulk_update_status_column_async(
-                    msg.id,
-                    values_by_member,
-                )
+            if result == _SYNC_SYNCED:
                 synced_count += 1
-                
-                # [修正] API制限(429 Quota exceeded)回避のため、1件処理するごとに5秒待機
-                print("        ...Waiting 5s for API limits...")
-                await asyncio.sleep(5.0)
 
-            except APIError as e:
-                # 万が一制限に達してもBotごと落ちないようにキャッチしてスキップ/待機
-                print(f"    ⚠️ API Error on msg {msg.id}: {e}")
-                print("    Waiting 30s before retrying next message...")
-                await asyncio.sleep(30.0)
-                continue
-            
     return synced_count
 
 # ============================================================
@@ -456,6 +492,10 @@ async def _sync_latest_rsvp_in_guild(guild: discord.Guild) -> int:
 # ============================================================
 @bot.event
 async def on_ready() -> None:  # type: ignore[override]
+    """
+    Bot 起動完了時に一度だけ、参加中の各ギルドについて
+    メンバー同期と最新 RSVP 同期のバックグラウンドタスクを起動する。
+    """
     global _SYNC_DONE_ON_STARTUP
 
     print(f"Logged in as {bot.user} (id={bot.user.id})")
@@ -475,87 +515,362 @@ async def on_ready() -> None:  # type: ignore[override]
         _SYNC_DONE_ON_STARTUP = True
         print("Startup sync initiated.")
 
+    # 定期ループの起動（再接続時の多重起動を防ぐ）
+    if not reminder_loop.is_running():
+        reminder_loop.start()
+    if not daily_output_loop.is_running():
+        daily_output_loop.start()
+
+
+async def _handle_rsvp_post(message: discord.Message, ch_name: str) -> None:
+    """
+    RSVP チャンネルへの新規投稿を処理する：出欠絵文字を自動で付与し、
+    Sheets 側にまだ列が無ければ練習日列を追加する。
+
+    入力
+    ----
+    message : discord.Message
+        RSVP チャンネルに投稿されたメッセージ
+    ch_name : str
+        message が投稿されたチャンネル名（呼び出し側で解決済みのもの）
+
+    出力
+    ----
+    なし（Discord へのリアクション付与・Sheets への列追加を行う）
+    """
+    for key in ("出席", "欠席", "遅刻", "早退"):
+        emoji = discord.utils.get(message.guild.emojis, name=EMOJI_NAME[key])
+        if emoji:
+            await message.add_reaction(emoji)
+
+    # まだ Sheets にメッセージ ID 未登録なら列を追加して登録
+    header_str = _get_header_from_msg(message)
+    sheet_key = _sheet_key_from_channel_name(ch_name)
+    if sheet_key:
+        bridge = _bridge_for_sheet_key(sheet_key)
+        await bridge.add_event_column_async(header_str, message.id)
+
+
+# ============================================================
+# 未回答リマインド
+# ============================================================
+def _is_undecided(msg: discord.Message) -> bool:
+    """先頭行が『mm月DD日(未定)』形式かどうか"""
+    first = msg.content.splitlines()[0] if msg.content else ""
+    return bool(_DATE_RE_JP_UNDECIDED.search(first))
+
+
+async def _find_rsvp_posts_for_date(
+    guild: discord.Guild, target: date
+) -> list[tuple[discord.Message, str]]:
+    """
+    全 RSVP チャンネルを走査し、練習日が target と一致する投稿を返す。
+    戻り値は (message, sheet_key) のリスト。
+    """
+    results: list[tuple[discord.Message, str]] = []
+    for ch_name in RSVP_CHANNELS:
+        channel = discord.utils.get(guild.text_channels, name=ch_name)
+        if channel is None:
+            continue
+        sheet_key = _sheet_key_from_channel_name(ch_name)
+        if sheet_key is None:
+            continue
+        try:
+            async for msg in channel.history(limit=REMINDER_SCAN_LIMIT):
+                if msg.author.bot:
+                    continue
+                if _is_undecided(msg):
+                    continue
+                dt = _parse_date_from_msg(msg)
+                if dt is not None and dt.date() == target:
+                    results.append((msg, sheet_key))
+        except discord.HTTPException as exc:
+            print(f"[reminder] history scan failed in {ch_name}: {exc}")
+    return results
+
+
+async def _compute_non_responders(
+    msg: discord.Message, sheet_key: str
+) -> list[discord.Member]:
+    """シート登録メンバーのうち、msg に出欠リアクションをしていない人を返す"""
+    bridge = _bridge_for_sheet_key(sheet_key)
+    registered = await bridge.registered_member_ids_async()
+    reacted = set(await _collect_attendance_from_reactions(msg))
+    members: list[discord.Member] = []
+    for uid in registered - reacted:
+        m = msg.guild.get_member(uid)
+        if m is None:
+            try:
+                m = await msg.guild.fetch_member(uid)
+            except discord.HTTPException:
+                continue  # 退会済み等は無視
+        if not m.bot:
+            members.append(m)
+    return members
+
+
+def _reminder_thread_name(practice_date: date) -> str:
+    return f"出欠リマインド {practice_date.month:02d}月{practice_date.day:02d}日"
+
+
+async def _get_or_create_reminder_thread(
+    msg: discord.Message, practice_date: date
+) -> discord.Thread:
+    channel = msg.channel
+    name = _reminder_thread_name(practice_date)
+
+    # 1) アクティブスレッドから名前で検索
+    for th in channel.threads:
+        if th.name == name:
+            return th
+    # 2) アーカイブ済みプライベートスレッドも検索（ベストエフォート）
+    try:
+        async for th in channel.archived_threads(private=True, limit=50):
+            if th.name == name:
+                return th
+    except discord.HTTPException:
+        pass
+    # 3) 新規作成（プライベート → 不可ならメッセージ上のパブリックにフォールバック）
+    try:
+        return await channel.create_thread(
+            name=name,
+            type=discord.ChannelType.private_thread,
+            invitable=True,
+            auto_archive_duration=4320,
+        )
+    except discord.HTTPException as exc:
+        print(f"[reminder] private thread failed ({exc}); falling back to public")
+        return await msg.create_thread(name=name, auto_archive_duration=4320)
+
+
+async def _already_reminded_today(thread: discord.Thread) -> bool:
+    """今日(JST)すでに bot がこのスレッドにリマインドを投稿済みか"""
+    today = datetime.now(JST).date()
+    try:
+        async for m in thread.history(limit=10):
+            if m.author.id == bot.user.id and m.created_at.astimezone(JST).date() == today:
+                return True
+    except discord.HTTPException:
+        pass
+    return False
+
+
+async def _send_reminder_for_post(
+    msg: discord.Message, sheet_key: str, practice_date: date, days_before: int
+) -> None:
+    non_responders = await _compute_non_responders(msg, sheet_key)
+    if not non_responders:
+        print(f"[reminder] no non-responders for {practice_date} in #{msg.channel}")
+        return
+
+    thread = await _get_or_create_reminder_thread(msg, practice_date)
+    if await _already_reminded_today(thread):
+        print(f"[reminder] already sent today in {thread.name}; skip")
+        return
+
+    role = discord.utils.get(msg.guild.roles, name=REMINDER_MENTION_ROLE)
+    role_mention = role.mention if role else f"@{REMINDER_MENTION_ROLE}"
+    mentions = " ".join(m.mention for m in non_responders)
+    label = "前日" if days_before == 1 else f"{days_before}日前"
+
+    content = (
+        f"📢 **出欠リマインド（練習{label}）** {role_mention}\n"
+        f"{practice_date.month}月{practice_date.day}日の練習の出欠が未回答です。\n"
+        f"こちらの投稿にリアクションで回答してください → {msg.jump_url}\n\n"
+        f"{mentions}"
+    )
+    await thread.send(
+        content,
+        allowed_mentions=discord.AllowedMentions(
+            users=True, roles=True, everyone=False
+        ),
+    )
+    print(f"[reminder] sent to {thread.name} ({len(non_responders)} members)")
+
+
+async def _run_reminder_job(days_list: list[int] | None = None) -> None:
+    """days_list の各オフセット（例 [3,1]）についてリマインドを実行"""
+    days_list = days_list or REMIND_DAYS_BEFORE
+    today = datetime.now(JST).date()
+    for guild in bot.guilds:
+        for days in days_list:
+            target = today + timedelta(days=days)
+            try:
+                posts = await _find_rsvp_posts_for_date(guild, target)
+            except Exception as exc:
+                print(f"[reminder] scan error ({guild.name}, +{days}d): {exc}")
+                continue
+            for msg, sheet_key in posts:
+                try:
+                    await _send_reminder_for_post(msg, sheet_key, target, days)
+                except Exception as exc:
+                    print(f"[reminder] send error (msg={msg.id}): {exc}")
+
+
+async def _run_daily_output_job() -> None:
+    """今日が練習日の投稿すべてについて出欠表を出力チャンネルへ送る"""
+    today = datetime.now(JST).date()
+    for guild in bot.guilds:
+        try:
+            posts = await _find_rsvp_posts_for_date(guild, today)
+        except Exception as exc:
+            print(f"[daily-output] scan error ({guild.name}): {exc}")
+            continue
+        for msg, sheet_key in posts:
+            try:
+                await _send_attendance_charts(
+                    guild=guild,
+                    channel=msg.channel,
+                    message_id=msg.id,
+                    bridge=_bridge_for_sheet_key(sheet_key),
+                    send_mode="channel",
+                    member=None,
+                )
+                print(f"[daily-output] charts sent for msg={msg.id}")
+            except Exception as exc:
+                print(f"[daily-output] output error (msg={msg.id}): {exc}")
+
+
+@tasks.loop(time=REMIND_TIME)
+async def reminder_loop() -> None:
+    try:
+        await _run_reminder_job()
+    except Exception as exc:
+        # 例外を漏らすと loop 自体が止まるため必ず握りつぶしてログ
+        print(f"[reminder] loop error: {exc}")
+
+
+@reminder_loop.before_loop
+async def _before_reminder_loop() -> None:
+    await bot.wait_until_ready()
+
+
+@tasks.loop(time=OUTPUT_TIME)
+async def daily_output_loop() -> None:
+    try:
+        await _run_daily_output_job()
+    except Exception as exc:
+        print(f"[daily-output] loop error: {exc}")
+
+
+@daily_output_loop.before_loop
+async def _before_daily_output_loop() -> None:
+    await bot.wait_until_ready()
+
+
+async def _handle_dm_reply_time(
+    message: discord.Message, ref_id: int
+) -> None:
+    """
+    遅刻／早退プロンプトへの DM 返信から時刻を読み取り、Sheets に登録する。
+
+    入力
+    ----
+    message : discord.Message
+        ユーザーが返信として送った DM メッセージ（本文が HH:MM 形式想定）
+    ref_id : int
+        返信先（Bot が送ったプロンプト）のメッセージ ID
+
+    出力
+    ----
+    なし。_PROMPT_CONTEXT に ref_id が無ければ何もしない
+    （呼び出し側で「紐付いていない返信」の案内を出す）。
+    """
+    ctx = _PROMPT_CONTEXT.get(ref_id)
+    if ctx is None:
+        return
+
+    server_msg_id, status, sheet_key = ctx
+    time_str = message.content.strip()
+    if not _valid_time(time_str):
+        await message.channel.send(
+            "❌ 形式が正しくありませんでした。"
+            "HH:MM（24 時間制）で入力し直してください。"
+        )
+        return
+
+    cell_value = f"遅刻({time_str}～)" if status == "遅刻" else f"早退(～{time_str})"
+
+    bridge = _bridge_for_sheet_key(sheet_key)
+    await bridge.update_status_async(server_msg_id, message.author.id, cell_value)
+    await message.add_reaction("✅")
+
+
+async def _handle_dm_message(message: discord.Message) -> None:
+    """
+    DM チャンネルで届いたメッセージを処理する。
+    Bot 自身の DM 送信は無視し、遅刻／早退プロンプトへの返信なら時刻を
+    登録、それ以外は使い方の案内を返す。
+
+    入力
+    ----
+    message : discord.Message
+        DM チャンネル（message.guild is None）で受信したメッセージ
+
+    出力
+    ----
+    なし
+    """
+    if message.author.bot:  # Bot が送った DM には反応しない（無限ループ防止）
+        return
+
+    if message.reference is None:
+        await message.channel.send(
+            "このDMには自動対応していません。\n"
+            "遅刻/早退の時刻を登録するには、当Botが送信した『確認メッセージ』に対して返信してください。\n"
+            "スマホではメッセージを長押しして「返信」を選択してください。"
+        )
+        return
+
+    ref_id = message.reference.message_id
+    if ref_id not in _PROMPT_CONTEXT:
+        await message.channel.send(
+            "この返信は当Botの確認メッセージに紐付いていないため処理できませんでした。\n"
+            "遅刻/早退の時刻を登録するには、当Botが送信した『確認メッセージ』に対して返信してください。\n"
+            "スマホではメッセージを長押しして「返信」を選択してください。"
+        )
+        return
+
+    await _handle_dm_reply_time(message, ref_id)
+
 
 @bot.event
 async def on_message(message: discord.Message) -> None:
-    # RSVP チャンネルで投稿があったら自動でリアクションを付与
+    """
+    全メッセージ受信時のエントリポイント。
+    RSVP 投稿への自動リアクション付与、コマンド処理、DM 対応の
+    3 つの関心事をそれぞれ専用関数に委譲するだけの orchestrator。
+    """
     ch_name = str(message.channel)
     if ch_name in RSVP_CHANNELS and not message.author.bot:
-        for key in ("出席", "欠席", "遅刻", "早退"):
-            emoji = discord.utils.get(message.guild.emojis, name=EMOJI_NAME[key])
-            if emoji:
-                await message.add_reaction(emoji)
-
-        # まだ Sheets にメッセージ ID 未登録なら列を追加して登録
-        # [変更] 新しいヘッダ生成ロジックを使用
-        header_str = _get_header_from_msg(message)
-        sheet_key = _sheet_key_from_channel_name(ch_name)
-        if sheet_key:
-            bridge = _bridge_for_sheet_key(sheet_key)
-            await bridge.add_event_column_async(header_str, message.id)
+        await _handle_rsvp_post(message, ch_name)
 
     await bot.process_commands(message)  # これを忘れるとコマンドが動かない
 
-    # ===== DM 返信での遅刻／早退時刻登録＋非返信DMの案内 ====================
     if message.guild is None:
-        # Bot が送った DM メッセージには反応しない（無限ループ防止）
-        if message.author.bot:
-            return
-
-        if message.reference:
-            # 返信として届いた DM
-            ref_id = message.reference.message_id
-            ctx = _PROMPT_CONTEXT.get(ref_id)
-            if ctx:
-                server_msg_id, status, sheet_key = ctx
-                time_str = message.content.strip()
-                if not _valid_time(time_str):
-                    await message.channel.send(
-                        "❌ 形式が正しくありませんでした。"
-                        "HH:MM（24 時間制）で入力し直してください。"
-                    )
-                else:
-                    if status == "遅刻":
-                        cell_value = f"遅刻({time_str}～)"
-                    else:  # 早退
-                        cell_value = f"早退(～{time_str})"
-
-                    bridge = _bridge_for_sheet_key(sheet_key)
-                    await bridge.update_status_async(
-                        server_msg_id,
-                        message.author.id,
-                        cell_value,
-                    )
-                    await message.add_reaction("✅")
-            else:
-                # 返信ではあるが、当Botの確認メッセージへの返信ではない
-                await message.channel.send(
-                    "この返信は当Botの確認メッセージに紐付いていないため処理できませんでした。\n"
-                    "遅刻/早退の時刻を登録するには、当Botが送信した『確認メッセージ』に対して返信してください。\n"
-                    "スマホではメッセージを長押しして「返信」を選択してください。"
-                )
-        else:
-            # 返信でない DM はガイダンスを返す
-            await message.channel.send(
-                "このDMには自動対応していません。\n"
-                "遅刻/早退の時刻を登録するには、当Botが送信した『確認メッセージ』に対して返信してください。\n"
-                "スマホではメッセージを長押しして「返信」を選択してください。"
-            )
+        await _handle_dm_message(message)
 
 
-@bot.event
-async def on_raw_reaction_add(
+async def _resolve_reacting_member(
+    guild: discord.Guild,
     payload: discord.RawReactionActionEvent,
-) -> None:
-    """リアクション追加ハンドラ"""
+) -> discord.Member | None:
+    """
+    リアクションを押したメンバーを解決する。
 
-    # -------------------------------------------------
-    # Guild / Member 取得
-    # -------------------------------------------------
-    guild = bot.get_guild(payload.guild_id)
-    if guild is None:  # DM など
-        return
+    入力
+    ----
+    guild : discord.Guild
+        リアクションが発生したギルド
+    payload : discord.RawReactionActionEvent
+        リアクション追加イベントのペイロード
 
+    出力
+    ----
+    discord.Member | None
+        解決できたメンバー。Bot 自身のリアクション、
+        またはメンバーが見つからない場合は None。
+    """
     member: discord.Member | None = payload.member
     if member is None:  # キャッシュに居ない場合は取得を試みる
         member = guild.get_member(payload.user_id)
@@ -563,98 +878,138 @@ async def on_raw_reaction_add(
             try:
                 member = await guild.fetch_member(payload.user_id)
             except discord.NotFound:
-                return
+                return None
 
-    # Bot リアクションは無視
     if member.bot:
-        return
+        return None
+    return member
 
-    # -------------------------------------------------
-    # 以降、payload.member ではなく member を使用
-    # -------------------------------------------------
-    channel = guild.get_channel(payload.channel_id)
-    if channel is None:
-        return
-    ch_name = str(channel)
-    if ch_name not in RSVP_CHANNELS:
-        return
 
-    sheet_key = _sheet_key_from_channel_name(ch_name)
-    if sheet_key is None:
-        return
-    bridge = _bridge_for_sheet_key(sheet_key)
+def _format_date_jp(msg: discord.Message, *, with_weekday: bool) -> str:
+    """
+    メッセージから練習日を推定し、日本語の日付文字列を作る。
 
-    raw_name = payload.emoji.name
-    emoji_name = _norm_emoji(raw_name)
-    message_id = payload.message_id
+    入力
+    ----
+    msg : discord.Message
+        練習日を推定する元になる RSVP 投稿
+    with_weekday : bool
+        True なら "07月31日(木)" 形式、False なら "07月31日" 形式
 
-    # 出席系ステータス更新 ------------------------------------
-    status = status_from_emoji(emoji_name)
-    if status:
-        await bridge.update_status_async(message_id, member.id, status)
+    出力
+    ----
+    str
+        日付文字列。本文から日付が読み取れなければ投稿日時（JST）を使う。
+    """
+    dt = _parse_date_from_msg(msg)
+    if dt is None:
+        dt = msg.created_at.replace(tzinfo=timezone.utc) + timedelta(hours=9)
 
-        # ---- 遅刻／早退 → DM で時刻を問い合わせ ----
-        if status in {"遅刻", "早退"}:
-            msg = await channel.fetch_message(message_id)
-            # [変更] 日付解析
-            dt = _parse_date_from_msg(msg)
-            # 日付不明なら投稿日で
-            if dt:
-                date_str_jp = f"{dt.month:02d}月{dt.day:02d}日" # 年なし
-            else:
-                jst = msg.created_at.replace(tzinfo=timezone.utc) + timedelta(hours=9)
-                date_str_jp = f"{jst.month:02d}月{jst.day:02d}日"
+    if with_weekday:
+        weekday_jp = _WEEKDAYS_JP[dt.weekday()]
+        return f"{dt.month:02d}月{dt.day:02d}日({weekday_jp})"
+    return f"{dt.month:02d}月{dt.day:02d}日"
 
-            await _send_time_prompt(
-                member=member,
-                server_message_id=message_id,
-                date_str_jp=date_str_jp,
-                status=status,
-                sheet_key=sheet_key,
-            )
-        return
 
-    # ✅: 練習日列の手動追加 -----------------------------------
-    if emoji_name == CHECKMARK_EMOJI:
-        msg = await channel.fetch_message(message_id)
+async def _handle_status_reaction(
+    *,
+    status: str,
+    channel: discord.TextChannel,
+    message_id: int,
+    member: discord.Member,
+    sheet_key: str,
+    bridge: SheetAsyncBridge,
+) -> None:
+    """
+    出席／欠席／遅刻／早退のリアクションを処理する。
 
-        # 0) 列の追加（既存なら既存列番号が返るだけ）
-        # [変更] 新しいヘッダ生成ロジック
-        header_str = _get_header_from_msg(msg)
-        await bridge.add_event_column_async(header_str, message_id)
+    入力
+    ----
+    status : str
+        '出席' '欠席' '遅刻' '早退' のいずれか
+    channel, message_id : discord.TextChannel, int
+        対象の RSVP メッセージを特定する情報
+    member : discord.Member
+        リアクションを押したメンバー
+    sheet_key, bridge : str, SheetAsyncBridge
+        書き込み先シートの選択情報
 
-        # 1) リアクションを集計して列一括更新（1 API call）
-        values_by_member = await _collect_attendance_from_reactions(msg)
-        await bridge.bulk_update_status_column_async(
-            message_id,
-            values_by_member,
-        )
+    出力
+    ----
+    なし。Sheets のステータスを更新し、遅刻／早退なら
+    DM で時刻を問い合わせるプロンプトを送る。
+    """
+    await bridge.update_status_async(message_id, member.id, status)
 
-        # 2) ✅ を消す
-        await msg.remove_reaction(payload.emoji, member)
-        return
-
-    # 出力系 ---------------------------------------------------
-    if _norm_emoji(emoji_name) == _norm_emoji(EMOJI_NAME["出力"]):
-        send_mode = "channel"
-    elif _norm_emoji(emoji_name) == _norm_emoji(EMOJI_NAME["DM"]):
-        send_mode = "dm"
-    else:
+    if status not in {"遅刻", "早退"}:
         return
 
     msg = await channel.fetch_message(message_id)
-    
-    # [変更] 画像生成用の日付文字列も新ロジックから取得
-    # ここでは年を含まない短い形式が欲しいので _parse_date_from_msg を使う
-    dt = _parse_date_from_msg(msg)
-    if dt:
-        weekday_jp = _WEEKDAYS_JP[dt.weekday()]
-        date_str_jp = f"{dt.month:02d}月{dt.day:02d}日({weekday_jp})"
-    else:
-        # フォールバック
-        jst = msg.created_at.replace(tzinfo=timezone.utc) + timedelta(hours=9)
-        weekday_jp = _WEEKDAYS_JP[jst.weekday()]
-        date_str_jp = f"{jst.month:02d}月{jst.day:02d}日({weekday_jp})"
+    date_str_jp = _format_date_jp(msg, with_weekday=False)  # 年・曜日なし
+
+    await _send_time_prompt(
+        member=member,
+        server_message_id=message_id,
+        date_str_jp=date_str_jp,
+        status=status,
+        sheet_key=sheet_key,
+    )
+
+
+async def _handle_checkmark_reaction(
+    *,
+    channel: discord.TextChannel,
+    message_id: int,
+    member: discord.Member,
+    pushed_emoji: discord.PartialEmoji,
+    bridge: SheetAsyncBridge,
+) -> None:
+    """
+    ✅ リアクション（練習日列の手動同期）を処理する。
+
+    入力
+    ----
+    channel, message_id : discord.TextChannel, int
+        対象の RSVP メッセージを特定する情報
+    member : discord.Member
+        ✅ を押したメンバー（処理後にリアクションを外される）
+    pushed_emoji : discord.PartialEmoji
+        押された絵文字そのもの（remove_reaction に使う）
+    bridge : SheetAsyncBridge
+        書き込み先シート
+
+    出力
+    ----
+    なし。列を確保し、現在のリアクション集計で一括更新したうえで
+    ✅ を消す。
+    """
+    msg = await channel.fetch_message(message_id)
+
+    header_str = _get_header_from_msg(msg)
+    await bridge.add_event_column_async(header_str, message_id)
+
+    values_by_member = await _collect_attendance_from_reactions(msg)
+    await bridge.bulk_update_status_column_async(message_id, values_by_member)
+
+    await msg.remove_reaction(pushed_emoji, member)
+
+
+async def _send_attendance_charts(
+    *,
+    guild: discord.Guild,
+    channel: discord.TextChannel,
+    message_id: int,
+    bridge: SheetAsyncBridge,
+    send_mode: str,
+    member: discord.Member | None = None,
+) -> None:
+    """
+    対象メッセージの出欠表画像を各プログラム分生成して送信する。
+    send_mode='channel' なら出力チャンネルへ、'dm' なら member へ DM。
+    member はエラー通知先（None ならログ出力のみ）。
+    """
+    msg = await channel.fetch_message(message_id)
+    date_str_jp = _format_date_jp(msg, with_weekday=True)
 
     out_ch: discord.TextChannel | None = None
     if send_mode == "channel":
@@ -675,20 +1030,129 @@ async def on_raw_reaction_add(
                     "❌ 画像を作成中にエラーが発生しました。\n"
                     f"詳細: {exc}"
                 )
-            await member.send(msg_text)
-            return
-        else:
-            img_path = await asyncio.to_thread(
-                _draw_attendance_chart,
-                attendance,
-                date_str_jp,
-                prog,
-            )
-            file = discord.File(img_path)
-            if send_mode == "channel":
-                await out_ch.send(file=file)
+            if member is not None:
+                await member.send(msg_text)
             else:
-                await member.send(file=file)
+                print(f"[daily-output] {msg_text}")
+            return
+
+        img_path = await asyncio.to_thread(
+            _draw_attendance_chart, attendance, date_str_jp, prog
+        )
+        file = discord.File(img_path)
+        if send_mode == "channel":
+            await out_ch.send(file=file)
+        else:
+            await member.send(file=file)
+
+
+async def _handle_output_reaction(
+    *,
+    send_mode: str,
+    guild: discord.Guild,
+    channel: discord.TextChannel,
+    message_id: int,
+    member: discord.Member,
+    bridge: SheetAsyncBridge,
+) -> None:
+    """
+    出力／DM リアクションを処理し、各プログラムの出欠画像を送信する。
+
+    入力
+    ----
+    send_mode : str
+        'channel'（出力チャンネルへ送信）または 'dm'（押した人へ DM）
+    guild, channel, message_id : 対象の RSVP メッセージを特定する情報
+    member : discord.Member
+        リアクションを押したメンバー（DM 送信先、エラー通知先）
+    bridge : SheetAsyncBridge
+        出欠データの取得元シート
+
+    出力
+    ----
+    なし。プログラムごとに画像を生成し、出力チャンネルまたは DM へ送る。
+    Sheets 側のヘッダ重複などでエラーが起きた場合は member に通知して打ち切る。
+    """
+    await _send_attendance_charts(
+        guild=guild,
+        channel=channel,
+        message_id=message_id,
+        bridge=bridge,
+        send_mode=send_mode,
+        member=member,
+    )
+
+
+@bot.event
+async def on_raw_reaction_add(
+    payload: discord.RawReactionActionEvent,
+) -> None:
+    """
+    リアクション追加ハンドラ（orchestrator）。
+    RSVP チャンネル内の対象リアクションを種類ごとに判定し、
+    _handle_status_reaction / _handle_checkmark_reaction /
+    _handle_output_reaction のいずれかへ委譲する。
+    """
+    guild = bot.get_guild(payload.guild_id)
+    if guild is None:  # DM など
+        return
+
+    member = await _resolve_reacting_member(guild, payload)
+    if member is None:
+        return
+
+    channel = guild.get_channel(payload.channel_id)
+    if channel is None:
+        return
+    ch_name = str(channel)
+    if ch_name not in RSVP_CHANNELS:
+        return
+
+    sheet_key = _sheet_key_from_channel_name(ch_name)
+    if sheet_key is None:
+        return
+    bridge = _bridge_for_sheet_key(sheet_key)
+
+    emoji_name = _norm_emoji(payload.emoji.name)
+    message_id = payload.message_id
+
+    status = status_from_emoji(emoji_name)
+    if status:
+        await _handle_status_reaction(
+            status=status,
+            channel=channel,
+            message_id=message_id,
+            member=member,
+            sheet_key=sheet_key,
+            bridge=bridge,
+        )
+        return
+
+    if emoji_name == CHECKMARK_EMOJI:
+        await _handle_checkmark_reaction(
+            channel=channel,
+            message_id=message_id,
+            member=member,
+            pushed_emoji=payload.emoji,
+            bridge=bridge,
+        )
+        return
+
+    if _norm_emoji(emoji_name) == _norm_emoji(EMOJI_NAME["出力"]):
+        send_mode = "channel"
+    elif _norm_emoji(emoji_name) == _norm_emoji(EMOJI_NAME["DM"]):
+        send_mode = "dm"
+    else:
+        return
+
+    await _handle_output_reaction(
+        send_mode=send_mode,
+        guild=guild,
+        channel=channel,
+        message_id=message_id,
+        member=member,
+        bridge=bridge,
+    )
 
 
 # ============================================================
@@ -697,6 +1161,59 @@ async def on_raw_reaction_add(
 # -----------------------------------------------------------
 # $ append @member プログラム パート 席次
 # -----------------------------------------------------------
+async def _confirm_overwrite(
+    ctx: commands.Context, member: discord.Member, error: CellOccupiedError
+) -> bool:
+    """
+    乗り番の上書き確認ダイアログを出し、ユーザーの反応を待つ。
+
+    入力
+    ----
+    ctx : commands.Context
+        確認メッセージを送るコマンドコンテキスト
+    member : discord.Member
+        上書き対象のメンバー（メッセージ表示用）
+    error : CellOccupiedError
+        既存値と新しい値の情報を持つ例外
+
+    出力
+    ----
+    bool
+        ✅ が押されて上書き承認された場合 True。
+        タイムアウト／キャンセルの場合は False
+        （その場合、案内メッセージの編集まで済ませてある）。
+    """
+    warn_msg = (
+        f"{member.mention} さんは既に "
+        f"{error.program} で {error.prev_part}-{error.prev_num} として登録されています。\n"
+        f"新しく {error.new_part}-{error.new_num} で上書きしてもよろしいですか？\n"
+        f"{CHECKMARK_EMOJI}：上書きする  {CANCEL_EMOJI}：キャンセル（30 秒以内）"
+    )
+    warn = await ctx.send(warn_msg)
+    await warn.add_reaction("✅")
+    await warn.add_reaction(CANCEL_EMOJI)
+
+    def check(reaction: discord.Reaction, user: discord.User) -> bool:
+        return (
+            reaction.message.id == warn.id
+            and str(reaction.emoji) in {CHECKMARK_EMOJI, CANCEL_EMOJI}
+            and user.id == ctx.author.id
+        )
+
+    try:
+        reaction, _ = await bot.wait_for("reaction_add", timeout=30.0, check=check)
+    except asyncio.TimeoutError:
+        await warn.edit(content="タイムアウトしました。上書きは行われませんでした。")
+        return False
+
+    if str(reaction.emoji) == CANCEL_EMOJI:
+        await warn.edit(content="キャンセルしました。上書きは行われませんでした。")
+        return False
+
+    await warn.delete()  # ダイアログを片付ける
+    return True
+
+
 @bot.command(
     name="append",
     help="$ append @member プログラム名 パート 席次",
@@ -710,7 +1227,6 @@ async def append_prefix_cmd(
     num: int,
 ) -> None:
     """乗り番（パート・席次）を SpreadSheet に登録する（全奏のみ）"""
-    # ---------- 入力チェック ----------
     if program not in PROGRAMS:
         await ctx.send(
             f"プログラム名 '{program}' は無効です。\n"
@@ -728,36 +1244,9 @@ async def append_prefix_cmd(
             overwrite=False,
         )
     except CellOccupiedError as e:
-        # --- 既に登録済み：上書き確認 ---
-        warn_msg = (
-            f"{member.mention} さんは既に "
-            f"{e.program} で {e.prev_part}-{e.prev_num} として登録されています。\n"
-            f"新しく {e.new_part}-{e.new_num} で上書きしてもよろしいですか？\n"
-            f"{CHECKMARK_EMOJI}：上書きする  {CANCEL_EMOJI}：キャンセル（30 秒以内）"
-        )
-        warn = await ctx.send(warn_msg)
-        await warn.add_reaction("✅")
-        await warn.add_reaction(CANCEL_EMOJI)
-
-        def check(reaction: discord.Reaction, user: discord.User) -> bool:
-            return (
-                reaction.message.id == warn.id
-                and str(reaction.emoji) in {CHECKMARK_EMOJI, CANCEL_EMOJI}
-                and user.id == ctx.author.id
-            )
-
-        try:
-            reaction, _ = await bot.wait_for("reaction_add", timeout=30.0, check=check)
-        except asyncio.TimeoutError:
-            await warn.edit(content="タイムアウトしました。上書きは行われませんでした。")
+        approved = await _confirm_overwrite(ctx, member, e)
+        if not approved:
             return
-
-        # -------- ユーザー反応を判定 ----------
-        if str(reaction.emoji) == CANCEL_EMOJI:
-            await warn.edit(content="キャンセルしました。上書きは行われませんでした。")
-            return
-
-        # -------- 上書き実行（✅ が押された場合） ----------
         await sheet_bridge_ensou.append_member_async(
             program=program,
             part=part,
@@ -766,7 +1255,6 @@ async def append_prefix_cmd(
             member_id=member.id,
             overwrite=True,
         )
-        await warn.delete()  # ダイアログを片付ける
 
     # ---------- 成功：コマンド発言に ✅ ---------------
     await ctx.message.add_reaction("✅")
@@ -782,6 +1270,7 @@ async def append_prefix_cmd(
 )
 @commands.has_any_role(*OUTPUT_ROLES)
 async def sync_members_cmd(ctx: commands.Context) -> None:
+    """ギルドメンバーのうち Sheets 未登録の人だけを全奏シートに追加する"""
     with_part, no_part = await _sync_members_to_sheet(ctx.guild, gs_manager_ensou)
     await ctx.send(
         f"✅ 同期完了: 追加 {with_part + no_part} 名 "
@@ -807,6 +1296,25 @@ async def sync_rsvp_cmd(ctx: commands.Context) -> None:
     
     await msg.edit(content=f"✅ 同期完了: {count} 件のRSVPチャンネルを更新しました。")
     await ctx.message.add_reaction("✅")
+
+
+@bot.command(name="remind")
+@commands.has_any_role(*OUTPUT_ROLES)
+async def cmd_remind(ctx: commands.Context, days_before: int | None = None) -> None:
+    """手動でリマインドを実行する。$remind または $remind 3"""
+    days = [days_before] if days_before is not None else None
+    await ctx.send("⏳ リマインドを実行します…")
+    await _run_reminder_job(days)
+    await ctx.send("✅ リマインド処理が完了しました。")
+
+
+@bot.command(name="outputtoday")
+@commands.has_any_role(*OUTPUT_ROLES)
+async def cmd_outputtoday(ctx: commands.Context) -> None:
+    """手動で当日出欠表出力を実行する。"""
+    await ctx.send("⏳ 当日の出欠表を出力します…")
+    await _run_daily_output_job()
+    await ctx.send("✅ 出力処理が完了しました。")
 
 # ============================================================
 # その他ヘルパ
@@ -931,9 +1439,6 @@ _DATE_RE_FULL = re.compile(r"(\d{4})[/-](\d{1,2})[/-](\d{1,2})")
 _DATE_RE_MD = re.compile(r"(\d{1,2})[/-](\d{1,2})")
 _DATE_RE_JP = re.compile(r"(\d{1,2})月(\d{1,2})日")
 _DATE_RE_JP_UNDECIDED = re.compile(r"(\d{1,2})月(?:DD|dd)日")
-
-# JST (UTC+9)
-JST = timezone(timedelta(hours=9))
 
 def _parse_date_from_msg(msg: discord.Message) -> datetime | None:
     """
