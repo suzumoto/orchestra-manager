@@ -8,7 +8,7 @@ Google Slides 上の図形から
 """
 
 from __future__ import annotations
-import pickle
+import json
 import re
 from pathlib import Path
 from typing import Dict, Tuple, Optional
@@ -89,30 +89,86 @@ class SeatLayoutSlides:
     @staticmethod
     def _build_cache_path(presentation_id: str, slide_index: int) -> Path:
         safe_id = re.sub(r"[^0-9A-Za-z_-]", "_", presentation_id)
-        fname = f"{safe_id}_{slide_index}.pkl"
+        fname = f"{safe_id}_{slide_index}.json"
         return _CACHE_DIR / fname
 
     # ------------------ cache I/O -------------------------------
-    def _load_from_cache(self) -> None:
-        with self._cache_path.open("rb") as fp:
-            data = pickle.load(fp)
+    @staticmethod
+    def _shape_info_to_json(info: Dict) -> Dict:
+        out = dict(info)
+        out["center"] = list(info["center"])
+        out["size"] = list(info["size"])
+        if "fill" in info:
+            out["fill"] = list(info["fill"])
+        if "font" in info:
+            out["font"] = list(info["font"])
+        return out
 
-        self.seats = data["seats"]
-        self.legends = data["legends"]
-        self.conductor_pos = data["conductor_pos"]
-        self.logo_box = data["logo_box"]
-        self.title_box = data["title_box"]
+    @staticmethod
+    def _shape_info_from_json(info: Dict) -> Dict:
+        out = dict(info)
+        out["center"] = tuple(info["center"])
+        out["size"] = tuple(info["size"])
+        if "fill" in info:
+            out["fill"] = tuple(info["fill"])
+        if "font" in info:
+            out["font"] = tuple(info["font"])
+        return out
+
+    def _load_from_cache(self) -> None:
+        with self._cache_path.open("r", encoding="utf-8") as fp:
+            data = json.load(fp)
+
+        self.seats = {}
+        for key, info in data["seats"].items():
+            part, num_str = key.rsplit(":", 1)
+            self.seats[(part, int(num_str))] = self._shape_info_from_json(info)
+
+        self.legends = {
+            label: self._shape_info_from_json(info)
+            for label, info in data["legends"].items()
+        }
+
+        self.conductor_pos = (
+            tuple(data["conductor_pos"]) if data["conductor_pos"] is not None else None
+        )
+        self.logo_box = (
+            self._shape_info_from_json(data["logo_box"])
+            if data["logo_box"] is not None
+            else None
+        )
+        self.title_box = (
+            self._shape_info_from_json(data["title_box"])
+            if data["title_box"] is not None
+            else None
+        )
 
     def _save_to_cache(self) -> None:
         data = {
-            "seats": self.seats,
-            "legends": self.legends,
-            "conductor_pos": self.conductor_pos,
-            "logo_box": self.logo_box,
-            "title_box": self.title_box,
+            "seats": {
+                f"{part}:{num}": self._shape_info_to_json(info)
+                for (part, num), info in self.seats.items()
+            },
+            "legends": {
+                label: self._shape_info_to_json(info)
+                for label, info in self.legends.items()
+            },
+            "conductor_pos": (
+                list(self.conductor_pos) if self.conductor_pos is not None else None
+            ),
+            "logo_box": (
+                self._shape_info_to_json(self.logo_box)
+                if self.logo_box is not None
+                else None
+            ),
+            "title_box": (
+                self._shape_info_to_json(self.title_box)
+                if self.title_box is not None
+                else None
+            ),
         }
-        with self._cache_path.open("wb") as fp:
-            pickle.dump(data, fp)
+        with self._cache_path.open("w", encoding="utf-8") as fp:
+            json.dump(data, fp, ensure_ascii=False, indent=2)
 
     @staticmethod
     def _extract_label(elem: dict) -> Optional[str]:
