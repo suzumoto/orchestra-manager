@@ -3,11 +3,23 @@ from __future__ import annotations
 
 import asyncio
 import threading
+from datetime import date
 from typing import Dict, Tuple, List
 import re
 
 import gspread
 from google.oauth2.service_account import Credentials
+
+from sheet_design import apply_design, date_header_format_request
+
+# Google Sheets の日付シリアル値の起点
+_SHEETS_EPOCH = date(1899, 12, 30)
+
+
+def _date_iso_to_serial(date_iso: str) -> int:
+    """'YYYY/MM/DD' 形式の日付を Sheets のシリアル値に変換する"""
+    y, m, d = map(int, date_iso.split("/"))
+    return (date(y, m, d) - _SHEETS_EPOCH).days
 
 _STATUS_PREFIXES = ("出席", "欠席", "遅刻", "早退")
 _TOKEN_RE = re.compile(
@@ -79,6 +91,20 @@ def _merge_status_with_existing(old_val: str, new_status: str) -> str:
     new_parts = new_status.split()
     merged_parts = [old_tokens.get(part, part) for part in new_parts]
     return " ".join(merged_parts)
+
+
+class SheetTargetNotFoundError(Exception):
+    """message_id または member_id がシートのインデックスに無い場合に送出"""
+    def __init__(self, *, message_id: int | None = None, member_id: int | None = None) -> None:
+        self.message_id = message_id
+        self.member_id = member_id
+        if message_id is not None and member_id is not None:
+            reason = f"message_id={message_id}, member_id={member_id} ともに未登録"
+        elif message_id is not None:
+            reason = f"message_id={message_id} が列に登録されていません"
+        else:
+            reason = f"member_id={member_id} が行に登録されていません"
+        super().__init__(reason)
 
 
 class CellOccupiedError(Exception):
@@ -181,10 +207,30 @@ class GoogleSheetsManager:
     # ----------------------------------------------------------
     # 列追加：練習日（ヘッダ=日付, 2 行目=message_id）
     # ----------------------------------------------------------
-    def add_event_column(self, header_str: str, message_id: int) -> int:
+    def add_event_column(
+        self,
+        header_str: str,
+        message_id: int,
+        event_date_iso: str | None = None,
+    ) -> int:
         """
-        新しい練習日列を一番右に追加し、ヘッダとメッセージ ID を記入
-        既に message_id が登録済みなら既存列を返すだけ
+        新しい練習日列を追加し、ヘッダとメッセージ ID を記入する。
+        既に message_id が登録済みなら既存列を返すだけ。
+
+        入力
+        ----
+        header_str : str
+            表示用ヘッダ文字列（event_date_iso が無い場合のみ使う。
+            例: '10月DD日(未定)'）
+        message_id : int
+            RSVP 投稿の Discord メッセージ ID（列の同一性のキー）
+        event_date_iso : str | None
+            練習日が確定している場合の 'YYYY/MM/DD' 文字列。
+            指定するとヘッダは実際の日付値（年情報を内部に保持）として
+            書き込まれ、表示形式 'M月D日(曜)' が設定される。さらに既存の
+            日付列と比較して時系列順の位置に列を挿入する
+            （例: 12月25日の列の右に 1月15日の列が入る）。
+
         Returns
         -------
         col : int
@@ -196,12 +242,59 @@ class GoogleSheetsManager:
             if message_id in self._msgid_to_col:
                 return self._msgid_to_col[message_id]
 
-            # 右端の次列へ書き込み
-            new_col = len(self._col_to_header) + 1
-            self.ws.update_cell(_HEADER_DATE_ROW, new_col, header_str)
+            append_col = len(self._col_to_header) + 1
+
+            if event_date_iso is None:
+                # 日付未確定：従来どおりテキストヘッダを右端へ追加
+                new_col = append_col
+                self.ws.update_cell(_HEADER_DATE_ROW, new_col, header_str)
+                self.ws.update_cell(_MESSAGE_ID_ROW, new_col, str(message_id))
+                self._build_index()
+                return new_col
+
+            # ---- 日付確定：時系列順の挿入位置を決める ----
+            new_serial = _date_iso_to_serial(event_date_iso)
+            date_start_col = len(_default_headers(self.programs)) + 1
+
+            # ヘッダ行を未加工値で取得（日付セルはシリアル値になる）
+            raw = self.ws.get(
+                f"{_HEADER_DATE_ROW}:{_HEADER_DATE_ROW}",
+                value_render_option="UNFORMATTED_VALUE",
+            )
+            row1 = raw[0] if raw else []
+
+            insert_at: int | None = None
+            for col in range(date_start_col, len(row1) + 1):
+                val = row1[col - 1]
+                if isinstance(val, (int, float)) and val > new_serial:
+                    insert_at = col
+                    break
+
+            if insert_at is not None:
+                # 途中に空列を挿入（書式は左隣から引き継ぐ）
+                self.ws.insert_cols(
+                    [[]], col=insert_at, inherit_from_before=True
+                )
+                new_col = insert_at
+            else:
+                new_col = append_col
+
+            # ヘッダは実際の日付値として書き込む（年情報を保持）
+            a1 = f"{self._col_to_a1(new_col)}{_HEADER_DATE_ROW}"
+            self.ws.update(
+                values=[[event_date_iso]],
+                range_name=a1,
+                value_input_option="USER_ENTERED",
+            )
             self.ws.update_cell(_MESSAGE_ID_ROW, new_col, str(message_id))
 
-            # インデックスを更新
+            # 表示形式 'M月D日(曜)' を設定
+            self.sh.batch_update({
+                "requests": [
+                    date_header_format_request(self.ws.id, new_col - 1)
+                ]
+            })
+
             self._build_index()
             return new_col
 
@@ -210,6 +303,55 @@ class GoogleSheetsManager:
         with self._lock:
             self._refresh_index()
             return set(self._member_to_row.keys())
+
+    def set_resolved_bases(
+        self,
+        message_id: int,
+        member_id: int,
+        bases: List[str],
+    ) -> None:
+        """
+        現在アクティブな出欠リアクションの解決結果でセルを書き換える
+        （Discord 側のリアクション付け外しイベントから呼ばれる）。
+
+        入力
+        ----
+        message_id, member_id : int, int
+            行・列を特定するキー
+        bases : list[str]
+            [] （未回答/空欄）、['出席']、['欠席']、['遅刻']、['早退']、
+            ['遅刻', '早退'] のいずれか
+
+        出力
+        ----
+        なし。遅刻／早退については、セルに既に残っている時刻情報
+        （DM 返信で登録済みの場合）を消さずに保持する。
+        """
+        with self._lock:
+            self._refresh_index()
+            if message_id not in self._msgid_to_col or member_id not in self._member_to_row:
+                raise SheetTargetNotFoundError(
+                    message_id=None if message_id in self._msgid_to_col else message_id,
+                    member_id=None if member_id in self._member_to_row else member_id,
+                )
+            col = self._msgid_to_col[message_id]
+            row = self._member_to_row[member_id]
+
+            if not bases:
+                new_val = ""
+            elif bases[0] in ("出席", "欠席"):
+                new_val = bases[0]
+            else:
+                current_raw = self.ws.cell(row, col).value or ""
+                late_leave_tokens = _extract_late_leave_tokens(current_raw)
+                parts = []
+                if "遅刻" in bases:
+                    parts.append(late_leave_tokens.get("遅刻", "遅刻"))
+                if "早退" in bases:
+                    parts.append(late_leave_tokens.get("早退", "早退"))
+                new_val = " ".join(parts)
+
+            self.ws.update_cell(row, col, new_val)
 
     def update_status(
         self,
@@ -241,37 +383,42 @@ class GoogleSheetsManager:
            - 同じ種類を押し直したら置き換え
            - 片方だけ来た場合は既存のもう一方を温存
         """
-        # -------- 行・列の特定 --------------------------------
-        self._refresh_index()  # ← Lock とインデックス再構築
-        col = self._msgid_to_col[message_id]
-        row = self._member_to_row[member_id]
+        with self._lock:
+            self._refresh_index()
+            if message_id not in self._msgid_to_col or member_id not in self._member_to_row:
+                raise SheetTargetNotFoundError(
+                    message_id=None if message_id in self._msgid_to_col else message_id,
+                    member_id=None if member_id in self._member_to_row else member_id,
+                )
+            col = self._msgid_to_col[message_id]
+            row = self._member_to_row[member_id]
 
-        current_raw = self.ws.cell(row, col).value or ""
-        late_leave_tokens = _extract_late_leave_tokens(current_raw)
+            current_raw = self.ws.cell(row, col).value or ""
+            late_leave_tokens = _extract_late_leave_tokens(current_raw)
 
-        # -------- 新ステータスを反映 ----------------------------
-        base = (
-            "遅刻" if status_name.startswith("遅刻") else
-            "早退" if status_name.startswith("早退") else
-            status_name  # 出席 or 欠席
-        )
+            # -------- 新ステータスを反映 ----------------------------
+            base = (
+                "遅刻" if status_name.startswith("遅刻") else
+                "早退" if status_name.startswith("早退") else
+                status_name  # 出席 or 欠席
+            )
 
-        if base in {"出席", "欠席"}:
-            # 1. 出席／欠席は単独で確定
-            new_val = base
-        else:
-            # 2. 遅刻／早退は共存可
-            late_leave_tokens[base] = status_name.strip()  # 置き換え or 挿入
-            # 片方だけ残っているかもしれないので順序を固定化
-            parts = []
-            if "遅刻" in late_leave_tokens:
-                parts.append(late_leave_tokens["遅刻"])
-            if "早退" in late_leave_tokens:
-                parts.append(late_leave_tokens["早退"])
-            new_val = " ".join(parts).strip()
+            if base in {"出席", "欠席"}:
+                # 1. 出席／欠席は単独で確定
+                new_val = base
+            else:
+                # 2. 遅刻／早退は共存可
+                late_leave_tokens[base] = status_name.strip()  # 置き換え or 挿入
+                # 片方だけ残っているかもしれないので順序を固定化
+                parts = []
+                if "遅刻" in late_leave_tokens:
+                    parts.append(late_leave_tokens["遅刻"])
+                if "早退" in late_leave_tokens:
+                    parts.append(late_leave_tokens["早退"])
+                new_val = " ".join(parts).strip()
 
-        # -------- シートへ書き込み ------------------------------
-        self.ws.update_cell(row, col, new_val)
+            # -------- シートへ書き込み ------------------------------
+            self.ws.update_cell(row, col, new_val)
 
     # ----------------------------------------------------------
     # draw.py 用：1 日の出欠を dict で取得
@@ -415,7 +562,7 @@ class GoogleSheetsManager:
 
             col_a1 = self._col_to_a1(col)
             rng = f"{col_a1}{_DATA_START_ROW}:{col_a1}{last_row}"
-            self.ws.update(rng, write_values)
+            self.ws.update(values=write_values, range_name=rng)
 
     def _build_status_column_values(
         self,
@@ -557,15 +704,35 @@ class GoogleSheetsManager:
         """
         1 行目（ヘッダ）と 2 行目（メッセージ ID 行）が無ければ作成。
         ヘッダはプログラム数に応じて動的に生成する。
+
+        注意: 2 行目は、イベント列が 1 つも無い間は中身が全部空欄になる
+        （それ自体が正常な状態）。「2 行目の中身が空かどうか」では
+        作成済みかどうかを判定できないため、判定は「1 行目（ヘッダ）が
+        まだ無かったかどうか」の 1 回だけで行い、2 行目もそのタイミングで
+        まとめて作る（毎回の起動時に誤って空行を追加しないため）。
         """
         heads = _default_headers(self.programs)
 
         if not any(self.ws.row_values(_HEADER_DATE_ROW)):
             self.ws.insert_row(heads, index=_HEADER_DATE_ROW)
-
-        if not any(self.ws.row_values(_MESSAGE_ID_ROW)):
             # ヘッダ長と同数の空セルを用意
             self.ws.insert_row([""] * len(heads), index=_MESSAGE_ID_ROW)
+            # 初期化時にシートデザイン（書式）も適用する
+            self.apply_design()
+
+    def apply_design(self) -> None:
+        """
+        シートのデザイン（書式）を適用する。
+
+        セルの値には触れず、色・列幅・非表示・条件付き書式のみを設定する
+        （詳細は sheet_design.py を参照）。シート初期化時に自動で呼ばれる
+        ほか、デザインを張り直したいときに手動で呼んでもよい（再実行安全）。
+        書式は見た目だけの問題なので、失敗しても bot の起動は止めない。
+        """
+        try:
+            apply_design(self.sh, self.ws, len(self.programs))
+        except Exception as e:  # noqa: BLE001
+            print(f"[sheet_design] デザイン適用に失敗しました: {e}")
 
     # ------------------------------------------------------------------
     # Row append
@@ -617,16 +784,24 @@ class GoogleSheetsManager:
             if member_id in self._member_to_row:
                 row = self._member_to_row[member_id]
 
-                # discord表示名は無条件更新
                 disp_col = heads.index("discord表示名") + 1
-                if self.ws.cell(row, disp_col).value != display_name:
-                    self.ws.update_cell(row, disp_col, display_name)
-
                 part_col = heads.index(f"{program}_パート") + 1
                 num_col = heads.index(f"{program}_席次") + 1
+                last_col = max(disp_col, part_col, num_col)
 
-                prev_part = self.ws.cell(row, part_col).value or ""
-                prev_num = self.ws.cell(row, num_col).value or ""
+                # 対象範囲を 1 回の読み取りでまとめて取得
+                row_values = self.ws.get(
+                    f"{self._col_to_a1(1)}{row}:{self._col_to_a1(last_col)}{row}"
+                )
+                row_vals = row_values[0] if row_values else []
+
+                def _cell(col: int) -> str:
+                    idx = col - 1
+                    return str(row_vals[idx]).strip() if idx < len(row_vals) else ""
+
+                prev_disp = _cell(disp_col)
+                prev_part = _cell(part_col)
+                prev_num = _cell(num_col)
 
                 has_existing_value = bool(prev_part) or bool(prev_num)
                 conflicts = has_existing_value and (
@@ -634,13 +809,22 @@ class GoogleSheetsManager:
                 )
 
                 if conflicts and not overwrite:
+                    if prev_disp != display_name:
+                        self.ws.update_cell(row, disp_col, display_name)
                     raise CellOccupiedError(
                         row, program, prev_part, prev_num, part, num
                     )
 
-                # 初回登録（空欄）・衝突なし・overwrite指定のいずれでも書き込む
-                self.ws.update_cell(row, part_col, part)
-                self.ws.update_cell(row, num_col, str(num))
+                # discord表示名は無条件更新、パート・席次は初回登録・衝突なし・overwrite指定のいずれでも書き込む
+                updates = [
+                    {"range": f"{self._col_to_a1(part_col)}{row}", "values": [[part]]},
+                    {"range": f"{self._col_to_a1(num_col)}{row}", "values": [[str(num)]]},
+                ]
+                if prev_disp != display_name:
+                    updates.append(
+                        {"range": f"{self._col_to_a1(disp_col)}{row}", "values": [[display_name]]}
+                    )
+                self.ws.batch_update(updates)
 
                 self._build_index()
                 return
@@ -695,10 +879,11 @@ class SheetAsyncBridge:
         self,
         header_str: str,
         message_id: int,
+        event_date_iso: str | None = None,
     ) -> int:
         """GoogleSheetsManager.add_event_column を別スレッドで実行する"""
         return await asyncio.to_thread(
-            self.gs.add_event_column, header_str, message_id
+            self.gs.add_event_column, header_str, message_id, event_date_iso
         )
 
     async def append_member_async(
@@ -737,3 +922,14 @@ class SheetAsyncBridge:
     async def registered_member_ids_async(self) -> set[int]:
         """GoogleSheetsManager.registered_member_ids を別スレッドで実行する"""
         return await asyncio.to_thread(self.gs.registered_member_ids)
+
+    async def set_resolved_bases_async(
+        self,
+        message_id: int,
+        member_id: int,
+        bases: List[str],
+    ) -> None:
+        """GoogleSheetsManager.set_resolved_bases を別スレッドで実行する"""
+        await asyncio.to_thread(
+            self.gs.set_resolved_bases, message_id, member_id, bases
+        )

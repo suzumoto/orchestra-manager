@@ -9,5 +9,6 @@ credentials.json
 .env
 .seat_layout_cache
 .venv
+reaction_order.json
 
 PLAN.md
