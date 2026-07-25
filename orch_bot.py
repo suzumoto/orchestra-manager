@@ -646,10 +646,27 @@ async def _sync_members_to_sheet(
             added_no_part += 1
 
     await asyncio.to_thread(gs.append_rows_bulk, rows_to_append)
-    if rows_to_append:
-        # 追加行は末尾に積まれるので、パート順に並べ替え直す
-        await asyncio.to_thread(gs.sort_members_by_part, PART_SORT_ORDER)
     return added_with_part, added_no_part
+
+
+async def _sort_and_realign_sheets() -> tuple[int, int]:
+    """
+    全奏シートをパート順に並べ替え、分奏シートのイベント列を
+    全奏の新しい行順に追従させる。
+
+    分奏の固定列 A〜I は ARRAYFORMULA で全奏を参照しているため、
+    メンバー情報の並びは全奏の並べ替えに自動追従する。一方で
+    分奏のイベント列（出欠データ）は静的な値なので、Discord ID で
+    対応づけて同じ並びに書き直す（realign_event_rows）。
+
+    Returns
+    -------
+    (全奏で並べ替えた行数, 分奏で追従させたイベント行数)
+    """
+    n_sorted = await sheet_bridge_ensou.sort_members_by_part_async(PART_SORT_ORDER)
+    id_order = await sheet_bridge_ensou.member_id_order_async()
+    n_realigned = await sheet_bridge_bunsou.realign_event_rows_async(id_order)
+    return n_sorted, n_realigned
 
 
 # (message_id, member_id) → 現在有効な出欠リアクションの追加順リスト
@@ -768,20 +785,20 @@ async def _sync_latest_rsvp_in_guild(guild: discord.Guild) -> int:
 
 async def _startup_sync() -> None:
     """
-    ギルドごとにメンバー同期 ×2 → RSVP 同期を直列に実行する。
+    ギルドごとにメンバー同期（全奏のみ）→ RSVP 同期を直列に実行する。
     API クォータ保護のため並行実行はしない。on_ready をブロックしないよう
     バックグラウンドタスクとして呼び出される想定。
     """
     for g in bot.guilds:
         print(f"Syncing members for guild: {g.name}...")
+        # メンバー情報のマスターは全奏シート。分奏の固定列は
+        # ARRAYFORMULA による全奏参照なので直接書き込まない。
         try:
-            await _sync_members_to_sheet(g, gs_manager_ensou)
+            added = await _sync_members_to_sheet(g, gs_manager_ensou)
+            if any(added):
+                await _sort_and_realign_sheets()
         except Exception as exc:
-            print(f"[startup-sync] ensou member sync error ({g.name}): {exc}")
-        try:
-            await _sync_members_to_sheet(g, gs_manager_bunsou)
-        except Exception as exc:
-            print(f"[startup-sync] bunsou member sync error ({g.name}): {exc}")
+            print(f"[startup-sync] member sync error ({g.name}): {exc}")
 
         print(f"Syncing latest RSVP for guild: {g.name}...")
         try:
@@ -1721,19 +1738,18 @@ async def append_prefix_cmd(
 )
 @commands.has_any_role(*OUTPUT_ROLES)
 async def sync_members_cmd(ctx: commands.Context) -> None:
-    """ギルドメンバーのうち Sheets 未登録の人だけを全奏・分奏の両シートに追加する"""
-    ensou_with_part, ensou_no_part = await _sync_members_to_sheet(
-        ctx.guild, gs_manager_ensou
-    )
-    bunsou_with_part, bunsou_no_part = await _sync_members_to_sheet(
-        ctx.guild, gs_manager_bunsou
-    )
+    """
+    ギルドメンバーのうち Sheets 未登録の人だけを全奏シートに追加する。
+    分奏シートのメンバー情報は全奏参照（ARRAYFORMULA）なので自動で追従する。
+    追加があった場合はパート順の並べ替えと分奏イベント列の追従も行う。
+    """
+    with_part, no_part = await _sync_members_to_sheet(ctx.guild, gs_manager_ensou)
+    if with_part + no_part > 0:
+        await _sort_and_realign_sheets()
     await ctx.send(
-        f"✅ 同期完了\n"
-        f"全奏: 追加 {ensou_with_part + ensou_no_part} 名 "
-        f"(パート判定あり {ensou_with_part} 名, パート無し {ensou_no_part} 名)\n"
-        f"分奏: 追加 {bunsou_with_part + bunsou_no_part} 名 "
-        f"(パート判定あり {bunsou_with_part} 名, パート無し {bunsou_no_part} 名)"
+        f"✅ 同期完了: 追加 {with_part + no_part} 名 "
+        f"(パート判定あり {with_part} 名, パート無し {no_part} 名)\n"
+        f"※分奏シートは全奏参照のため自動反映"
     )
     await ctx.message.add_reaction("✅")
 
@@ -1744,12 +1760,14 @@ async def sync_members_cmd(ctx: commands.Context) -> None:
 )
 @commands.has_any_role(*OUTPUT_ROLES)
 async def sort_members_cmd(ctx: commands.Context) -> None:
-    """全奏・分奏の両シートのデータ行を settings.ini のパート順に並べ替える"""
+    """全奏シートをパート順に並べ替え、分奏のイベント列を追従させる"""
     msg = await ctx.send("🔄 パート順に並べ替え中...")
-    n_ensou = await sheet_bridge_ensou.sort_members_by_part_async(PART_SORT_ORDER)
-    n_bunsou = await sheet_bridge_bunsou.sort_members_by_part_async(PART_SORT_ORDER)
+    n_sorted, n_realigned = await _sort_and_realign_sheets()
     await msg.edit(
-        content=f"✅ 並べ替え完了（全奏 {n_ensou} 行 / 分奏 {n_bunsou} 行）"
+        content=(
+            f"✅ 並べ替え完了（全奏 {n_sorted} 行 / "
+            f"分奏イベント列の追従 {n_realigned} 行）"
+        )
     )
     await ctx.message.add_reaction("✅")
 
