@@ -304,6 +304,34 @@ class GoogleSheetsManager:
             self._refresh_index()
             return set(self._member_to_row.keys())
 
+    def is_event_hidden(self, message_id: int) -> bool:
+        """
+        message_id に対応するイベント列が「非表示」にされているかを返す。
+
+        運用ルール: 練習が中止になった場合、運営はシート上でその練習日の
+        列を非表示にする。Bot はこれを「中止マーカー」として扱い、
+        リマインドと当日出欠表の自動出力をスキップする
+        （列を再表示すれば自動的に再開する）。
+
+        列が存在しない・判定できない場合は False（=通常どおり扱う）。
+        """
+        with self._lock:
+            self._refresh_index()
+            col = self._msgid_to_col.get(message_id)
+            if col is None:
+                return False
+            meta = self.sh.fetch_sheet_metadata({
+                "fields": ("sheets(properties(sheetId),"
+                           "data(columnMetadata(hiddenByUser)))")
+            })
+            for s in meta.get("sheets", []):
+                if s["properties"]["sheetId"] != self.ws.id:
+                    continue
+                colmeta = s.get("data", [{}])[0].get("columnMetadata", [])
+                if col - 1 < len(colmeta):
+                    return bool(colmeta[col - 1].get("hiddenByUser"))
+            return False
+
     def member_id_order(self) -> List[int]:
         """データ行の並び順どおりの Discord ID リストを返す"""
         with self._lock:
@@ -1071,6 +1099,10 @@ class SheetAsyncBridge:
     ) -> int:
         """GoogleSheetsManager.sort_members_by_part を別スレッドで実行する"""
         return await asyncio.to_thread(self.gs.sort_members_by_part, part_order)
+
+    async def is_event_hidden_async(self, message_id: int) -> bool:
+        """GoogleSheetsManager.is_event_hidden を別スレッドで実行する"""
+        return await asyncio.to_thread(self.gs.is_event_hidden, message_id)
 
     async def member_id_order_async(self) -> List[int]:
         """GoogleSheetsManager.member_id_order を別スレッドで実行する"""
