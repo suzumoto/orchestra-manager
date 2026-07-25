@@ -106,6 +106,12 @@ OUTPUT_TIME = _parse_hhmm(_rem_cfg.get("output_time", "07:00"))
 REMINDER_MENTION_ROLE = _rem_cfg.get("mention_role", "運営")
 REMINDER_SCAN_LIMIT = int(_rem_cfg.get("scan_limit", "30"))
 
+# ---------------- メンバー同期設定 -------------------------
+# sync_role が設定されていれば、そのロール保持者のみをシートへ登録する
+# （空なら従来どおりサーバーの全メンバーが対象）
+_member_cfg = config["MEMBER"] if "MEMBER" in config else {}
+MEMBER_SYNC_ROLE = _member_cfg.get("sync_role", "").strip()
+
 # ---------------- Sheets / Slides ---------------------------
 SPREADSHEET_ID = os.getenv("SPREADSHEET_ID")
 if not SPREADSHEET_ID:
@@ -139,20 +145,40 @@ SHEET_KEY_ENSOU = "ensou"
 SHEET_KEY_BUNSOU = "bunsou"
 
 
-def _sheet_key_from_channel_name(ch_name: str) -> str | None:
-    if ch_name in RSVP_CHANNELS_ENSOU:
-        return SHEET_KEY_ENSOU
-    if ch_name in RSVP_CHANNELS_BUNSOU:
-        return SHEET_KEY_BUNSOU
-    return None
-
-
 def _bridge_for_sheet_key(sheet_key: str) -> SheetAsyncBridge:
     if sheet_key == SHEET_KEY_ENSOU:
         return sheet_bridge_ensou
     if sheet_key == SHEET_KEY_BUNSOU:
         return sheet_bridge_bunsou
     raise ValueError(f"unknown sheet_key: {sheet_key}")
+
+
+def _sheet_key_for_message(msg: discord.Message) -> str | None:
+    """
+    投稿内容から対応シート（全奏/分奏）を決める。
+
+    1 つのカレンダーチャンネルに全奏/分奏の投稿が混在する運用
+    （例: ザムスターク管弦楽団の #📅カレンダー）に対応するため、
+    日付行に『分奏』『全奏』のキーワードがあればそれを優先する。
+    キーワードが無い場合は、チャンネル名と全奏/分奏の対応が一意に
+    決まる場合のみ従来どおりチャンネル名で振り分ける
+    （settings.ini で同じチャンネルを両方に登録している場合は
+    振り分け不能 = None とし、トップ練・連絡事項などは対象外にする）。
+    """
+    line = _find_date_line(msg.content or "")
+    if "分奏" in line:
+        return SHEET_KEY_BUNSOU
+    if "全奏" in line:
+        return SHEET_KEY_ENSOU
+
+    ch_name = str(msg.channel)
+    in_ensou = ch_name in RSVP_CHANNELS_ENSOU
+    in_bunsou = ch_name in RSVP_CHANNELS_BUNSOU
+    if in_ensou and not in_bunsou:
+        return SHEET_KEY_ENSOU
+    if in_bunsou and not in_ensou:
+        return SHEET_KEY_BUNSOU
+    return None
 
 
 PRESENTATION_ID = os.getenv("SLIDES_PRESENTATION_ID")
@@ -578,7 +604,20 @@ async def _sync_members_to_sheet(
                 row[heads.index(f"{prog}_パート")] = part_norm
         return row
 
-    for m in guild.members:
+    # sync_role が設定されていればロール保持者のみを対象にする
+    if MEMBER_SYNC_ROLE:
+        sync_role = discord.utils.get(guild.roles, name=MEMBER_SYNC_ROLE)
+        if sync_role is None:
+            print(
+                f"[member-sync] ロール『{MEMBER_SYNC_ROLE}』が "
+                f"{guild.name} に見つからないため、メンバー同期をスキップします"
+            )
+            return 0, 0
+        target_members = sync_role.members
+    else:
+        target_members = guild.members
+
+    for m in target_members:
         if m.bot or m.id in gs._member_to_row:
             continue
         part_norm = _detect_part_from_roles(m)
@@ -609,7 +648,6 @@ _SYNC_SKIP = "skip"      # 対象外だった、またはエラーで今回は�
 
 async def _sync_message_if_recent(
     msg: discord.Message,
-    bridge: SheetAsyncBridge,
     today: date,
 ) -> str:
     """
@@ -619,10 +657,11 @@ async def _sync_message_if_recent(
     ----
     msg : discord.Message
         判定対象の投稿（RSVP チャンネルの履歴から 1 件）
-    bridge : SheetAsyncBridge
-        書き込み先シート
     today : date
         JST での「今日」の日付（過去投稿の判定基準）
+
+    書き込み先シートは投稿内容（全奏/分奏キーワード）から決定する。
+    振り分けられない投稿（トップ練・連絡事項など）はスキップする。
 
     出力
     ----
@@ -637,6 +676,11 @@ async def _sync_message_if_recent(
 
     if len(msg.reactions) == 0:  # ただの連絡事項とみなす
         return _SYNC_SKIP
+
+    sheet_key = _sheet_key_for_message(msg)
+    if sheet_key is None:  # 全奏/分奏いずれでもない投稿は対象外
+        return _SYNC_SKIP
+    bridge = _bridge_for_sheet_key(sheet_key)
 
     dt = _parse_date_from_msg(msg)
     if dt and not _is_undecided(msg) and dt.date() < today:
@@ -690,15 +734,10 @@ async def _sync_latest_rsvp_in_guild(guild: discord.Guild) -> int:
         if not channel:
             continue
 
-        sheet_key = _sheet_key_from_channel_name(ch_name)
-        if not sheet_key:
-            continue
-
-        bridge = _bridge_for_sheet_key(sheet_key)
         print(f"--- Scanning channel: {ch_name} ---")
 
         async for msg in channel.history(limit=20):
-            result = await _sync_message_if_recent(msg, bridge, today)
+            result = await _sync_message_if_recent(msg, today)
             if result == _SYNC_STOP:
                 break
             if result == _SYNC_SYNCED:
@@ -755,7 +794,7 @@ async def on_ready() -> None:  # type: ignore[override]
         daily_output_loop.start()
 
 
-async def _handle_rsvp_post(message: discord.Message, ch_name: str) -> None:
+async def _handle_rsvp_post(message: discord.Message) -> None:
     """
     RSVP チャンネルへの新規投稿を処理する：出欠絵文字を自動で付与し、
     Sheets 側にまだ列が無ければ練習日列を追加する。
@@ -764,13 +803,17 @@ async def _handle_rsvp_post(message: discord.Message, ch_name: str) -> None:
     ----
     message : discord.Message
         RSVP チャンネルに投稿されたメッセージ
-    ch_name : str
-        message が投稿されたチャンネル名（呼び出し側で解決済みのもの）
 
     出力
     ----
-    なし（Discord へのリアクション付与・Sheets への列追加を行う）
+    なし（Discord へのリアクション付与・Sheets への列追加を行う）。
+    全奏/分奏いずれにも振り分けられない投稿（トップ練・連絡事項など）は
+    出欠管理の対象外なので、リアクションも付けずに何もしない。
     """
+    sheet_key = _sheet_key_for_message(message)
+    if sheet_key is None:
+        return
+
     for key in ("出席", "欠席", "遅刻", "早退"):
         emoji = discord.utils.get(message.guild.emojis, name=EMOJI_NAME[key])
         if emoji:
@@ -778,21 +821,18 @@ async def _handle_rsvp_post(message: discord.Message, ch_name: str) -> None:
 
     # まだ Sheets にメッセージ ID 未登録なら列を追加して登録
     header_str = _get_header_from_msg(message)
-    sheet_key = _sheet_key_from_channel_name(ch_name)
-    if sheet_key:
-        bridge = _bridge_for_sheet_key(sheet_key)
-        await bridge.add_event_column_async(
-            header_str, message.id, _get_event_date_iso(message)
-        )
+    bridge = _bridge_for_sheet_key(sheet_key)
+    await bridge.add_event_column_async(
+        header_str, message.id, _get_event_date_iso(message)
+    )
 
 
 # ============================================================
 # 未回答リマインド
 # ============================================================
 def _is_undecided(msg: discord.Message) -> bool:
-    """先頭行が『mm月DD日(未定)』形式かどうか"""
-    first = msg.content.splitlines()[0] if msg.content else ""
-    return bool(_DATE_RE_JP_UNDECIDED.search(first))
+    """日付行が『mm月DD日(未定)』形式かどうか"""
+    return bool(_DATE_RE_JP_UNDECIDED.search(_find_date_line(msg.content or "")))
 
 
 async def _find_rsvp_posts_for_date(
@@ -807,14 +847,14 @@ async def _find_rsvp_posts_for_date(
         channel = discord.utils.get(guild.text_channels, name=ch_name)
         if channel is None:
             continue
-        sheet_key = _sheet_key_from_channel_name(ch_name)
-        if sheet_key is None:
-            continue
         try:
             async for msg in channel.history(limit=REMINDER_SCAN_LIMIT):
                 if msg.author.bot:
                     continue
                 if _is_undecided(msg):
+                    continue
+                sheet_key = _sheet_key_for_message(msg)
+                if sheet_key is None:  # トップ練・連絡事項などは対象外
                     continue
                 dt = _parse_date_from_msg(msg)
                 if dt is not None and dt.date() == target:
@@ -1032,7 +1072,7 @@ async def on_message(message: discord.Message) -> None:
     """
     ch_name = str(message.channel)
     if ch_name in RSVP_CHANNELS and not message.author.bot:
-        await _handle_rsvp_post(message, ch_name)
+        await _handle_rsvp_post(message)
 
     await bot.process_commands(message)  # これを忘れるとコマンドが動かない
 
@@ -1446,8 +1486,12 @@ async def on_raw_reaction_add(
     if ch_name not in RSVP_CHANNELS:
         return
 
-    sheet_key = _sheet_key_from_channel_name(ch_name)
-    if sheet_key is None:
+    try:
+        msg = await channel.fetch_message(payload.message_id)
+    except discord.HTTPException:
+        return
+    sheet_key = _sheet_key_for_message(msg)
+    if sheet_key is None:  # 全奏/分奏いずれでもない投稿へのリアクションは無視
         return
     bridge = _bridge_for_sheet_key(sheet_key)
 
@@ -1518,8 +1562,12 @@ async def on_raw_reaction_remove(
     if ch_name not in RSVP_CHANNELS:
         return
 
-    sheet_key = _sheet_key_from_channel_name(ch_name)
-    if sheet_key is None:
+    try:
+        msg = await channel.fetch_message(payload.message_id)
+    except discord.HTTPException:
+        return
+    sheet_key = _sheet_key_for_message(msg)
+    if sheet_key is None:  # 全奏/分奏いずれでもない投稿へのリアクションは無視
         return
     bridge = _bridge_for_sheet_key(sheet_key)
 
@@ -1825,15 +1873,31 @@ _DATE_RE_MD = re.compile(r"(\d{1,2})[/-](\d{1,2})")
 _DATE_RE_JP = re.compile(r"(\d{1,2})月(\d{1,2})日")
 _DATE_RE_JP_UNDECIDED = re.compile(r"(\d{1,2})月(?:DD|dd)日")
 
+def _find_date_line(content: str) -> str:
+    """
+    本文から日付パターンを含む最初の行を返す（見つからなければ空文字）。
+
+    ザムスターク管弦楽団のカレンダー投稿は 1 行目が区切り線（-----）で
+    2 行目に『8/1 (土) 全奏 18:00-22:00 @会場』のように日付が来るため、
+    先頭行固定ではなく行を走査して日付行を探す。
+    """
+    for line in content.splitlines():
+        line = line.strip()
+        for pat in (_DATE_RE_FULL, _DATE_RE_JP_UNDECIDED, _DATE_RE_MD, _DATE_RE_JP):
+            if pat.search(line):
+                return line
+    return ""
+
+
 def _parse_date_from_msg(msg: discord.Message) -> datetime | None:
     """
     メッセージから練習日の datetime オブジェクトを推定して返す。
+    日付は本文中の最初の日付行（_find_date_line）から読み取る。
     年は「メッセージの投稿日時」を基準にする。
     原則として「投稿日よりも過去の練習日はあり得ない」という前提で、
     同年の日付が投稿日より過去になる場合は、翌年と判定する。
     """
-    text_first = msg.content.splitlines()[0] if msg.content else ""
-    text_first = text_first.strip()
+    text_first = _find_date_line(msg.content or "")
     
     # 投稿日時（JST）
     posted_at = msg.created_at.astimezone(JST)
@@ -1887,8 +1951,7 @@ def _get_event_date_iso(msg: discord.Message) -> str | None:
     add_event_column に渡すと、ヘッダが年情報込みの日付値として
     書き込まれ（表示は 'M月D日(曜)'）、時系列順の位置に列が挿入される。
     """
-    text_first = msg.content.splitlines()[0] if msg.content else ""
-    if _DATE_RE_JP_UNDECIDED.search(text_first):
+    if _is_undecided(msg):
         return None
 
     dt = _parse_date_from_msg(msg)
@@ -1917,8 +1980,7 @@ def _get_header_from_msg(msg: discord.Message) -> str:
         return f"{jst.month}月{jst.day}日({weekday_jp})"
 
     # 未定パターンかどうかの判定（ヘッダ文字列生成のため）
-    text_first = msg.content.splitlines()[0] if msg.content else ""
-    if _DATE_RE_JP_UNDECIDED.search(text_first):
+    if _is_undecided(msg):
          return f"{dt.month}月DD日(未定)"
 
     # 確定日付
