@@ -304,6 +304,73 @@ class GoogleSheetsManager:
             self._refresh_index()
             return set(self._member_to_row.keys())
 
+    def member_id_order(self) -> List[int]:
+        """データ行の並び順どおりの Discord ID リストを返す"""
+        with self._lock:
+            self._refresh_index()
+            return [
+                mid for mid, _row in
+                sorted(self._member_to_row.items(), key=lambda kv: kv[1])
+            ]
+
+    def realign_event_rows(self, id_order: List[int]) -> int:
+        """
+        データ行のイベント列（固定列 A〜I より右）だけを id_order の
+        行順に並べ替える。
+
+        固定列がARRAYFORMULA で別シート（全奏）を参照している分奏シート用。
+        メンバー行の並びは参照元のシートを並べ替えた瞬間に追従して変わるが、
+        イベント列は静的な値なので置いてけぼりになる。そこで各行の
+        イベント列の値を Discord ID で対応づけ、id_order（=参照元の
+        新しい行順）と同じ並びに書き直して整合を保つ。
+
+        入力
+        ----
+        id_order : list[int]
+            参照元シートのデータ行順の Discord ID リスト
+            （member_id_order の返り値をそのまま渡す）
+
+        出力
+        ----
+        int : id_order に対応づけて並べ替えたイベント行数
+        """
+        with self._lock:
+            self._refresh_index()
+            heads = _default_headers(self.programs)
+            n_fixed = len(heads)
+            id_idx = heads.index("Discord ID")
+
+            all_values = self.ws.get_values()
+            if len(all_values) < _DATA_START_ROW:
+                return 0
+            data = all_values[_DATA_START_ROW - 1:]
+            width = max((len(r) for r in data), default=0)
+            if width <= n_fixed:
+                return 0  # イベント列が無ければ何もしない
+            data = [r + [""] * (width - len(r)) for r in data]
+
+            blank = [""] * (width - n_fixed)
+            by_id: Dict[int, List[str]] = {}
+            for row in data:
+                try:
+                    mid = int(str(row[id_idx]).strip())
+                except ValueError:
+                    continue
+                by_id[mid] = row[n_fixed:]
+
+            ordered = [by_id.pop(mid, list(blank)) for mid in id_order]
+            rows_out = ordered + list(by_id.values())  # 対応先が無い行は末尾へ
+            while len(rows_out) < len(data):  # 短くなった分は空行で上書き
+                rows_out.append(list(blank))
+
+            rng = (
+                f"{self._col_to_a1(n_fixed + 1)}{_DATA_START_ROW}:"
+                f"{self._col_to_a1(width)}{_DATA_START_ROW + len(rows_out) - 1}"
+            )
+            self.ws.update(values=rows_out, range_name=rng)
+            self._build_index()
+            return len(ordered)
+
     def sort_members_by_part(self, part_order: List[List[str]]) -> int:
         """
         データ行（3 行目以降）をパート順に並べ替える。
@@ -1004,6 +1071,14 @@ class SheetAsyncBridge:
     ) -> int:
         """GoogleSheetsManager.sort_members_by_part を別スレッドで実行する"""
         return await asyncio.to_thread(self.gs.sort_members_by_part, part_order)
+
+    async def member_id_order_async(self) -> List[int]:
+        """GoogleSheetsManager.member_id_order を別スレッドで実行する"""
+        return await asyncio.to_thread(self.gs.member_id_order)
+
+    async def realign_event_rows_async(self, id_order: List[int]) -> int:
+        """GoogleSheetsManager.realign_event_rows を別スレッドで実行する"""
+        return await asyncio.to_thread(self.gs.realign_event_rows, id_order)
 
     async def set_resolved_bases_async(
         self,
