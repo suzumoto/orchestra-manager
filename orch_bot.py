@@ -728,24 +728,33 @@ async def _sync_message_if_recent(
     header_str = _get_header_from_msg(msg)
     print(f"    Syncing msg {msg.id} -> Header: {header_str}")
 
-    try:
-        await bridge.add_event_column_async(
-            header_str, msg.id, _get_event_date_iso(msg)
-        )
-        values_by_member = await _collect_attendance_from_reactions(msg)
-        await bridge.bulk_update_status_column_async(msg.id, values_by_member)
+    # 1 件の同期で Sheets の読み取りを 6〜8 回消費する。分間クォータ
+    # (60 read/min) の 429 が出た場合は、スキップせず同じメッセージを
+    # クォータ窓が明けるまで待ってから再試行する（取りこぼし防止）。
+    for attempt in range(3):
+        try:
+            await bridge.add_event_column_async(
+                header_str, msg.id, _get_event_date_iso(msg)
+            )
+            values_by_member = await _collect_attendance_from_reactions(msg)
+            await bridge.bulk_update_status_column_async(msg.id, values_by_member)
 
-        # API制限(429 Quota exceeded)回避のため、1件処理するごとに5秒待機
-        print("        ...Waiting 5s for API limits...")
-        await asyncio.sleep(5.0)
-        return _SYNC_SYNCED
+            # API制限(429 Quota exceeded)回避のため、1件処理するごとに10秒待機
+            print("        ...Waiting 10s for API limits...")
+            await asyncio.sleep(10.0)
+            return _SYNC_SYNCED
 
-    except APIError as e:
-        # 万が一制限に達してもBotごと落ちないようにキャッチしてスキップ/待機
-        print(f"    ⚠️ API Error on msg {msg.id}: {e}")
-        print("    Waiting 30s before retrying next message...")
-        await asyncio.sleep(30.0)
-        return _SYNC_SKIP
+        except APIError as e:
+            is_quota = getattr(getattr(e, "response", None), "status_code", None) == 429
+            if is_quota and attempt < 2:
+                print(f"    ⚠️ 429 Quota on msg {msg.id}: 70秒待機して同じ投稿を再試行します...")
+                await asyncio.sleep(70.0)
+                continue
+            # クォータ以外の API エラー、またはリトライ上限超過
+            print(f"    ⚠️ API Error on msg {msg.id}: {e}")
+            print("    Waiting 30s before moving to next message...")
+            await asyncio.sleep(30.0)
+            return _SYNC_SKIP
 
 
 async def _sync_latest_rsvp_in_guild(guild: discord.Guild) -> int:
