@@ -112,6 +112,24 @@ REMINDER_SCAN_LIMIT = int(_rem_cfg.get("scan_limit", "30"))
 _member_cfg = config["MEMBER"] if "MEMBER" in config else {}
 MEMBER_SYNC_ROLE = _member_cfg.get("sync_role", "").strip()
 
+
+def _parse_part_order(raw: str) -> list[list[str]]:
+    """'Fl/Picc, Ob/EHr, ...' 形式を別名グループのリストに変換する"""
+    groups: list[list[str]] = []
+    for grp in raw.split(","):
+        aliases = [a.strip() for a in grp.split("/") if a.strip()]
+        if aliases:
+            groups.append(aliases)
+    return groups
+
+
+# シートの行並べ替えに使うパート順（'/' 区切りは同順位の別名）
+PART_SORT_ORDER = _parse_part_order(_member_cfg.get(
+    "part_order",
+    "Fl/Picc, Ob/EHr, Cl/B.Cl, Fg/C.Fg, Hr, Tp, Tb/Tuba, "
+    "Timp, Perc, Vn/Vn1st/Vn2nd, Va, Vc, Cb",
+))
+
 # ---------------- Sheets / Slides ---------------------------
 SPREADSHEET_ID = os.getenv("SPREADSHEET_ID")
 if not SPREADSHEET_ID:
@@ -628,6 +646,9 @@ async def _sync_members_to_sheet(
             added_no_part += 1
 
     await asyncio.to_thread(gs.append_rows_bulk, rows_to_append)
+    if rows_to_append:
+        # 追加行は末尾に積まれるので、パート順に並べ替え直す
+        await asyncio.to_thread(gs.sort_members_by_part, PART_SORT_ORDER)
     return added_with_part, added_no_part
 
 
@@ -1715,6 +1736,23 @@ async def sync_members_cmd(ctx: commands.Context) -> None:
         f"(パート判定あり {bunsou_with_part} 名, パート無し {bunsou_no_part} 名)"
     )
     await ctx.message.add_reaction("✅")
+
+
+@bot.command(
+    name="sortmembers",
+    help="$ sortmembers : シートのメンバー行をパート順に並べ替える",
+)
+@commands.has_any_role(*OUTPUT_ROLES)
+async def sort_members_cmd(ctx: commands.Context) -> None:
+    """全奏・分奏の両シートのデータ行を settings.ini のパート順に並べ替える"""
+    msg = await ctx.send("🔄 パート順に並べ替え中...")
+    n_ensou = await sheet_bridge_ensou.sort_members_by_part_async(PART_SORT_ORDER)
+    n_bunsou = await sheet_bridge_bunsou.sort_members_by_part_async(PART_SORT_ORDER)
+    await msg.edit(
+        content=f"✅ 並べ替え完了（全奏 {n_ensou} 行 / 分奏 {n_bunsou} 行）"
+    )
+    await ctx.message.add_reaction("✅")
+
 
 @bot.command(
     name="sync",

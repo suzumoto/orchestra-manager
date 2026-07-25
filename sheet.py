@@ -304,6 +304,82 @@ class GoogleSheetsManager:
             self._refresh_index()
             return set(self._member_to_row.keys())
 
+    def sort_members_by_part(self, part_order: List[List[str]]) -> int:
+        """
+        データ行（3 行目以降）をパート順に並べ替える。
+
+        入力
+        ----
+        part_order : list[list[str]]
+            並び順を表すパート名グループのリスト。各グループは別名の集合で、
+            例: [["Fl", "Picc"], ["Ob", "EHr"], ...] なら Picc は Fl と
+            同じ位置に並ぶ。表記ゆれ対策として大文字小文字・記号は無視して
+            比較する（'B.Cl' と 'bcl' は同一視）。
+
+        並べ替えキー
+        ------------
+        1. パート順（最初に値が入っているプログラムのパート列を使う。
+           part_order に無いパートは末尾、パート未記入はさらに後ろ、
+           完全な空行は最後尾）
+        2. 同一パート内は席次の昇順（数値でなければ後ろ）
+        3. discord表示名
+
+        出力
+        ----
+        int : 並べ替え対象になったデータ行数
+        """
+        def _norm(s: str) -> str:
+            return "".join(ch for ch in s.lower() if ch.isalnum())
+
+        rank_by_alias: Dict[str, int] = {}
+        for rank, aliases in enumerate(part_order):
+            for alias in aliases:
+                rank_by_alias.setdefault(_norm(alias), rank)
+        unknown_rank = len(part_order)      # part_order に無いパート
+        no_part_rank = len(part_order) + 1  # パート未記入
+        empty_rank = len(part_order) + 2    # 完全な空行
+
+        with self._lock:
+            self._refresh_index()
+            heads = _default_headers(self.programs)
+            disp_idx = heads.index("discord表示名")
+            part_idxs = [heads.index(f"{p}_パート") for p in self.programs]
+            num_idxs = [heads.index(f"{p}_席次") for p in self.programs]
+
+            all_values = self.ws.get_values()
+            if len(all_values) < _DATA_START_ROW:
+                return 0
+            data = all_values[_DATA_START_ROW - 1:]
+            width = max(len(heads), max((len(r) for r in data), default=0))
+            data = [r + [""] * (width - len(r)) for r in data]
+
+            def sort_key(row: List[str]) -> tuple:
+                if not any(cell.strip() for cell in row):
+                    return (empty_rank, 0, "")
+                part = ""
+                num_raw = ""
+                for pi, ni in zip(part_idxs, num_idxs):
+                    if row[pi].strip():
+                        part = row[pi].strip()
+                        num_raw = row[ni].strip()
+                        break
+                if not part:
+                    return (no_part_rank, 0, row[disp_idx])
+                rank = rank_by_alias.get(_norm(part), unknown_rank)
+                try:
+                    num = int(num_raw)
+                except ValueError:
+                    num = 10 ** 9  # 席次未記入・数値以外は同パート内の後ろ
+                return (rank, num, row[disp_idx])
+
+            data.sort(key=sort_key)  # 安定ソートなので同キー内の順序は保持
+
+            last_row = _DATA_START_ROW + len(data) - 1
+            rng = f"A{_DATA_START_ROW}:{self._col_to_a1(width)}{last_row}"
+            self.ws.update(values=data, range_name=rng)
+            self._build_index()
+            return len(data)
+
     def set_resolved_bases(
         self,
         message_id: int,
@@ -922,6 +998,12 @@ class SheetAsyncBridge:
     async def registered_member_ids_async(self) -> set[int]:
         """GoogleSheetsManager.registered_member_ids を別スレッドで実行する"""
         return await asyncio.to_thread(self.gs.registered_member_ids)
+
+    async def sort_members_by_part_async(
+        self, part_order: List[List[str]]
+    ) -> int:
+        """GoogleSheetsManager.sort_members_by_part を別スレッドで実行する"""
+        return await asyncio.to_thread(self.gs.sort_members_by_part, part_order)
 
     async def set_resolved_bases_async(
         self,
