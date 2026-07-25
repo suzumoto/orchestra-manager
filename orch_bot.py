@@ -977,6 +977,11 @@ async def _already_reminded_today(thread: discord.Thread) -> bool:
 async def _send_reminder_for_post(
     msg: discord.Message, sheet_key: str, practice_date: date, days_before: int
 ) -> None:
+    # シートで列が非表示 = 練習中止のマーカー。リマインドしない
+    if await _bridge_for_sheet_key(sheet_key).is_event_hidden_async(msg.id):
+        print(f"[reminder] {practice_date} は列非表示（中止扱い）のためスキップ (msg={msg.id})")
+        return
+
     non_responders = await _compute_non_responders(msg, sheet_key)
     if not non_responders:
         print(f"[reminder] no non-responders for {practice_date} in #{msg.channel}")
@@ -1038,11 +1043,16 @@ async def _run_daily_output_job() -> None:
             continue
         for msg, sheet_key in posts:
             try:
+                bridge = _bridge_for_sheet_key(sheet_key)
+                # シートで列が非表示 = 練習中止のマーカー。出力しない
+                if await bridge.is_event_hidden_async(msg.id):
+                    print(f"[daily-output] msg={msg.id} は列非表示（中止扱い）のためスキップ")
+                    continue
                 await _send_attendance_charts(
                     guild=guild,
                     channel=msg.channel,
                     message_id=msg.id,
-                    bridge=_bridge_for_sheet_key(sheet_key),
+                    bridge=bridge,
                     send_mode="channel",
                     member=None,
                 )
