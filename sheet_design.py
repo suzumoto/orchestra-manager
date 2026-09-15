@@ -91,8 +91,11 @@ _PART_COLORS = {
     "Cb":    "#FFF8E1",
     # 木管（緑系）
     "Fl":    "#A5D6A7",
+    "Pic":   "#E8F5E9",
     "Ob":    "#C8E6C9",
+    "Ehr":   "#E0F2F1",
     "Cl":    "#C5E1A5",
+    "BCl":   "#F1F8E9",
     "Fg":    "#DCEDC8",
     # 金管（青系）
     "Hr":    "#90CAF9",

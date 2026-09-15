@@ -126,7 +126,7 @@ def _parse_part_order(raw: str) -> list[list[str]]:
 # シートの行並べ替えに使うパート順（'/' 区切りは同順位の別名）
 PART_SORT_ORDER = _parse_part_order(_member_cfg.get(
     "part_order",
-    "Fl/Picc, Ob/EHr, Cl/B.Cl, Fg/C.Fg, Hr, Tp/Cor, Tb/Tuba, "
+    "Fl/Picc/Pic, Ob/EHr, Cl/B.Cl, Fg/C.Fg, Hr, Tp/Cor, Tb/Tuba, "
     "Timp, Perc, Vn/Vn1st/Vn2nd, Va, Vc, Cb",
 ))
 
