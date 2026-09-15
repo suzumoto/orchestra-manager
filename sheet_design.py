@@ -97,6 +97,7 @@ _PART_COLORS = {
     # 金管（青系）
     "Hr":    "#90CAF9",
     "Tp":    "#BBDEFB",
+    "Cor":   "#E3F2FD",
     "Tb":    "#81D4FA",
     "Tuba":  "#B3E5FC",
     # 打楽器ほか（紫〜グレー系）

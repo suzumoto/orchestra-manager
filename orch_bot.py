@@ -126,7 +126,7 @@ def _parse_part_order(raw: str) -> list[list[str]]:
 # シートの行並べ替えに使うパート順（'/' 区切りは同順位の別名）
 PART_SORT_ORDER = _parse_part_order(_member_cfg.get(
     "part_order",
-    "Fl/Picc, Ob/EHr, Cl/B.Cl, Fg/C.Fg, Hr, Tp, Tb/Tuba, "
+    "Fl/Picc, Ob/EHr, Cl/B.Cl, Fg/C.Fg, Hr, Tp/Cor, Tb/Tuba, "
     "Timp, Perc, Vn/Vn1st/Vn2nd, Va, Vc, Cb",
 ))
 
@@ -203,11 +203,18 @@ PRESENTATION_ID = os.getenv("SLIDES_PRESENTATION_ID")
 if not PRESENTATION_ID:
     raise RuntimeError("環境変数 SLIDES_PRESENTATION_ID が未設定です。")
 
-layout = SeatLayoutSlides(
+# スライドの座席を編集したら再起動で反映されるよう、起動のたびに Slides API から
+# 読み直す。API が使えないときだけ前回のキャッシュで起動する。
+_SLIDES_ARGS = dict(
     presentation_id=PRESENTATION_ID,
     credential_json=config["SLIDES"].get("credential_json", "credentials.json"),
     slide_index=int(config["SLIDES"].get("slide_index", 1)),
 )
+try:
+    layout = SeatLayoutSlides(**_SLIDES_ARGS, use_slides=True)
+except Exception as exc:  # noqa: BLE001
+    print(f"[slides] 座席レイアウトを取得できなかったため、キャッシュを使います: {exc}")
+    layout = SeatLayoutSlides(**_SLIDES_ARGS, use_slides=False)
 LEGEND_COLOR = {
     label: (info["fill"], info["font"])
     for label, info in layout.legends.items()
