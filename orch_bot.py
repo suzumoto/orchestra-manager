@@ -471,6 +471,40 @@ class TimeInputButton(
         )
 
 
+def _time_input_thread_name(date_str_jp: str, status: str, member: discord.Member) -> str:
+    """本人専用の時刻入力スレッド名（Discord のスレッド名上限 100 文字に収める）"""
+    return f"⏰ {date_str_jp} {status} {member.display_name}"[:100]
+
+
+async def _get_or_create_time_input_thread(
+    msg: discord.Message,
+    member: discord.Member,
+    name: str,
+) -> discord.Thread:
+    """
+    member と Bot だけが参加するプライベートスレッドを取得または作成する。
+
+    同じ練習日・同じステータスのスレッドがアクティブなまま残っていれば
+    再利用する（リアクションの付け外しでスレッドが増えないように）。
+    アーカイブ済みのものは探さず新規作成する。
+    入力後もスレッドは削除しない（時刻の打ち直しに使えるように残す）。
+    """
+    channel = msg.channel
+    for th in channel.threads:
+        if th.name == name and th.type == discord.ChannelType.private_thread:
+            await th.add_user(member)
+            return th
+
+    thread = await channel.create_thread(
+        name=name,
+        type=discord.ChannelType.private_thread,
+        invitable=False,
+        auto_archive_duration=1440,
+    )
+    await thread.add_user(member)
+    return thread
+
+
 async def _post_time_input_button(
     *,
     msg: discord.Message,
@@ -480,8 +514,11 @@ async def _post_time_input_button(
     sheet_key: str,
 ) -> None:
     """
-    遅刻／早退した member 宛に、RSVP 投稿に紐づくスレッドへ
+    遅刻／早退した member 宛に、本人専用のプライベートスレッドへ
     時刻入力ボタン付きメッセージを投稿する。
+
+    プライベートスレッドの作成に失敗した場合は、RSVP 投稿に紐づく
+    共有スレッド（出欠リマインド）へ投稿して聞き漏れを防ぐ。
 
     入力
     ----
@@ -500,22 +537,29 @@ async def _post_time_input_button(
     ----
     なし（スレッド投稿失敗時は print ログのみ。Bot は落とさない）
     """
-    practice_date = _parse_date_from_msg(msg)
-    practice_date_d = (
-        practice_date.date() if practice_date else msg.created_at.astimezone(JST).date()
-    )
+    date_str_jp = _format_date_jp(msg, with_weekday=False)
 
     try:
-        thread = await _get_or_create_reminder_thread(msg, practice_date_d)
+        thread = await _get_or_create_time_input_thread(
+            msg, member, _time_input_thread_name(date_str_jp, status, member)
+        )
     except discord.HTTPException as exc:
-        print(f"[time-input] スレッド取得/作成に失敗: {exc}")
-        return
+        print(f"[time-input] プライベートスレッド作成に失敗、共有スレッドへ投稿します: {exc}")
+        practice_date = _parse_date_from_msg(msg)
+        practice_date_d = (
+            practice_date.date() if practice_date else msg.created_at.astimezone(JST).date()
+        )
+        try:
+            thread = await _get_or_create_reminder_thread(msg, practice_date_d)
+        except discord.HTTPException as exc2:
+            print(f"[time-input] スレッド取得/作成に失敗: {exc2}")
+            return
 
     verb = "到着" if status == "遅刻" else "退出"
-    date_str_jp = _format_date_jp(msg, with_weekday=False)
     content = (
         f"⏰ {member.mention} さん、{date_str_jp}の練習に{status}の予定ですね。"
-        f"下のボタンから{verb}予定時刻を入力してください。"
+        f"下のボタンから{verb}予定時刻を入力してください。\n"
+        f"時刻を間違えたときは、もう一度ボタンを押して入力し直せば上書きされます。"
     )
     view = discord.ui.View(timeout=None)
     view.add_item(
