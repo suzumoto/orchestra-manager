@@ -11,6 +11,7 @@ sys.stderr.reconfigure(encoding="utf-8", errors="backslashreplace", line_bufferi
 import os
 import asyncio
 import re
+from collections.abc import Awaitable, Callable
 import json
 from pathlib import Path
 from datetime import timezone, timedelta, datetime, date, time as dtime
@@ -105,6 +106,10 @@ REMIND_TIME = _parse_hhmm(_rem_cfg.get("remind_time", "19:00"))
 OUTPUT_TIME = _parse_hhmm(_rem_cfg.get("output_time", "07:00"))
 REMINDER_MENTION_ROLE = _rem_cfg.get("mention_role", "運営")
 REMINDER_SCAN_LIMIT = int(_rem_cfg.get("scan_limit", "30"))
+# 予定時刻の処理（リマインド・当日出欠表の自動出力）が通信障害などで失敗したとき、
+# 予定時刻から retry_hours 時間のあいだ retry_interval_minutes 分おきに再試行する
+JOB_RETRY_HOURS = float(_rem_cfg.get("retry_hours", "5"))
+JOB_RETRY_INTERVAL_MIN = float(_rem_cfg.get("retry_interval_minutes", "5"))
 
 # ---------------- メンバー同期設定 -------------------------
 # sync_role が設定されていれば、そのロール保持者のみをシートへ登録する
@@ -891,6 +896,10 @@ async def on_ready() -> None:  # type: ignore[override]
     if not daily_output_loop.is_running():
         daily_output_loop.start()
 
+    # 通信障害や再起動で予定時刻の実行を取りこぼしていたら、再試行の期限内なら取り戻す
+    for name, job, scheduled in _SCHEDULED_JOBS:
+        asyncio.create_task(_run_scheduled_job(name, job, scheduled))
+
 
 async def _handle_rsvp_post(message: discord.Message) -> None:
     """
@@ -939,6 +948,7 @@ async def _find_rsvp_posts_for_date(
     """
     全 RSVP チャンネルを走査し、練習日が target と一致する投稿を返す。
     戻り値は (message, sheet_key) のリスト。
+    履歴を読めなかったチャンネルがあれば例外を送出する（呼び出し側で失敗として扱う）。
     """
     results: list[tuple[discord.Message, str]] = []
     for ch_name in RSVP_CHANNELS:
@@ -959,6 +969,7 @@ async def _find_rsvp_posts_for_date(
                     results.append((msg, sheet_key))
         except discord.HTTPException as exc:
             print(f"[reminder] history scan failed in {ch_name}: {exc}")
+            raise
     return results
 
 
@@ -1073,10 +1084,18 @@ async def _send_reminder_for_post(
     print(f"[reminder] sent to {thread.name} ({len(non_responders)} members)")
 
 
-async def _run_reminder_job(days_list: list[int] | None = None) -> None:
-    """days_list の各オフセット（例 [3,1]）についてリマインドを実行"""
+async def _run_reminder_job(days_list: list[int] | None = None) -> bool:
+    """
+    days_list の各オフセット（例 [3,1]）についてリマインドを実行する。
+    すべて成功したら True、通信障害などで失敗があれば False を返す
+    （同じ日に同じ練習日のリマインドは二重に送らないので、再実行してよい）。
+    """
     days_list = days_list or REMIND_DAYS_BEFORE
     today = datetime.now(JST).date()
+    if not bot.guilds:
+        print("[reminder] Discord に未接続のため実行できません")
+        return False
+    ok = True
     for guild in bot.guilds:
         for days in days_list:
             target = today + timedelta(days=days)
@@ -1084,22 +1103,34 @@ async def _run_reminder_job(days_list: list[int] | None = None) -> None:
                 posts = await _find_rsvp_posts_for_date(guild, target)
             except Exception as exc:
                 print(f"[reminder] scan error ({guild.name}, +{days}d): {exc}")
+                ok = False
                 continue
             for msg, sheet_key in posts:
                 try:
                     await _send_reminder_for_post(msg, sheet_key, target, days)
                 except Exception as exc:
                     print(f"[reminder] send error (msg={msg.id}): {exc}")
+                    ok = False
+    return ok
 
 
-async def _run_daily_output_job() -> None:
-    """今日が練習日の投稿すべてについて出欠表を出力チャンネルへ送る"""
+async def _run_daily_output_job(skip_sent: bool = False) -> bool:
+    """
+    今日が練習日の投稿すべてについて出欠表を出力チャンネルへ送る。
+    skip_sent=True なら、今日すでに出力チャンネルへ送った画像は送らない（再試行用）。
+    すべて成功したら True、通信障害などで失敗があれば False を返す。
+    """
     today = datetime.now(JST).date()
+    if not bot.guilds:
+        print("[daily-output] Discord に未接続のため実行できません")
+        return False
+    ok = True
     for guild in bot.guilds:
         try:
             posts = await _find_rsvp_posts_for_date(guild, today)
         except Exception as exc:
             print(f"[daily-output] scan error ({guild.name}): {exc}")
+            ok = False
             continue
         for msg, sheet_key in posts:
             try:
@@ -1115,16 +1146,64 @@ async def _run_daily_output_job() -> None:
                     bridge=bridge,
                     send_mode="channel",
                     member=None,
+                    skip_sent_today=skip_sent,
                 )
                 print(f"[daily-output] charts sent for msg={msg.id}")
             except Exception as exc:
                 print(f"[daily-output] output error (msg={msg.id}): {exc}")
+                ok = False
+    return ok
+
+
+# ジョブ名 → その日の実行が成功した日付（JST）
+_JOB_DONE_ON: dict[str, date] = {}
+_JOB_LOCKS: dict[str, asyncio.Lock] = {}
+
+
+async def _run_scheduled_job(
+    name: str, job: Callable[[], Awaitable[bool]], scheduled: dtime
+) -> None:
+    """
+    その日の job が成功するまで、予定時刻 scheduled から JOB_RETRY_HOURS 時間のあいだ
+    JOB_RETRY_INTERVAL_MIN 分おきに再試行する。
+
+    予定時刻より前・期限を過ぎた後・その日すでに成功済みなら何もしない。
+    Discord への再接続時（on_ready）にも呼ばれ、障害中に取りこぼした実行を取り戻す。
+    同じジョブが並行して走らないよう、実行中なら何もせず戻る。
+    """
+    lock = _JOB_LOCKS.setdefault(name, asyncio.Lock())
+    if lock.locked():
+        return
+    async with lock:
+        while True:
+            now = datetime.now(JST)
+            start = datetime.combine(now.date(), scheduled)
+            deadline = start + timedelta(hours=JOB_RETRY_HOURS)
+            if _JOB_DONE_ON.get(name) == now.date():
+                return
+            # tasks.loop は予定時刻よりわずかに早く起きることがある
+            if not (start - timedelta(minutes=1) <= now <= deadline):
+                return
+            if await job():
+                _JOB_DONE_ON[name] = now.date()
+                return
+            print(
+                f"[{name}] 失敗したため {JOB_RETRY_INTERVAL_MIN:g} 分後に再試行します"
+                f"（{deadline:%H:%M} まで）"
+            )
+            await asyncio.sleep(JOB_RETRY_INTERVAL_MIN * 60)
+
+
+_SCHEDULED_JOBS: tuple[tuple[str, Callable[[], Awaitable[bool]], dtime], ...] = (
+    ("reminder", _run_reminder_job, REMIND_TIME),
+    ("daily-output", lambda: _run_daily_output_job(skip_sent=True), OUTPUT_TIME),
+)
 
 
 @tasks.loop(time=REMIND_TIME)
 async def reminder_loop() -> None:
     try:
-        await _run_reminder_job()
+        await _run_scheduled_job(*_SCHEDULED_JOBS[0])
     except Exception as exc:
         # 例外を漏らすと loop 自体が止まるため必ず握りつぶしてログ
         print(f"[reminder] loop error: {exc}")
@@ -1138,7 +1217,7 @@ async def _before_reminder_loop() -> None:
 @tasks.loop(time=OUTPUT_TIME)
 async def daily_output_loop() -> None:
     try:
-        await _run_daily_output_job()
+        await _run_scheduled_job(*_SCHEDULED_JOBS[1])
     except Exception as exc:
         print(f"[daily-output] loop error: {exc}")
 
@@ -1480,6 +1559,28 @@ async def _handle_checkmark_reaction(
     await msg.remove_reaction(pushed_emoji, member)
 
 
+def _chart_filename(message_id: int, prog_index: int) -> str:
+    """出欠表画像の添付ファイル名。Discord は添付ファイル名の非 ASCII 文字を落とすため英数字で作る"""
+    return f"attendance_{message_id}_{prog_index}.png"
+
+
+async def _chart_indices_sent_today(
+    out_ch: discord.TextChannel, message_id: int
+) -> set[int]:
+    """今日(JST) Bot が out_ch に送った message_id の出欠表画像の、プログラム番号の集合"""
+    midnight = datetime.combine(datetime.now(JST).date(), dtime(0, 0, tzinfo=JST))
+    pattern = re.compile(rf"^attendance_{message_id}_(\d+)\.png$")
+    sent: set[int] = set()
+    async for m in out_ch.history(after=midnight, limit=200):
+        if m.author.id != bot.user.id:
+            continue
+        for a in m.attachments:
+            hit = pattern.match(a.filename)
+            if hit:
+                sent.add(int(hit.group(1)))
+    return sent
+
+
 async def _send_attendance_charts(
     *,
     guild: discord.Guild,
@@ -1488,20 +1589,28 @@ async def _send_attendance_charts(
     bridge: SheetAsyncBridge,
     send_mode: str,
     member: discord.Member | None = None,
+    skip_sent_today: bool = False,
 ) -> None:
     """
     対象メッセージの出欠表画像を各プログラム分生成して送信する。
     send_mode='channel' なら出力チャンネルへ、'dm' なら member へ DM。
     member はエラー通知先（None ならログ出力のみ）。
+    skip_sent_today=True なら、今日すでに出力チャンネルへ送ったプログラムは送らない。
     """
     msg = await channel.fetch_message(message_id)
     date_str_jp = _format_date_jp(msg, with_weekday=True)
 
     out_ch: discord.TextChannel | None = None
+    sent: set[int] = set()
     if send_mode == "channel":
-        out_ch = discord.utils.get(guild.channels, name=OUTPUT_CHANNEL) or channel
+        # 同名チャンネルが複数あるときは、他の処理と同じく並び順が上の方を使う
+        out_ch = discord.utils.get(guild.text_channels, name=OUTPUT_CHANNEL) or channel
+        if skip_sent_today:
+            sent = await _chart_indices_sent_today(out_ch, message_id)
 
-    for prog in PROGRAMS:
+    for idx, prog in enumerate(PROGRAMS):
+        if idx in sent:
+            continue
         try:
             attendance = await bridge.attendance_dict_async(message_id, prog)
         except GSpreadException as exc:
@@ -1525,7 +1634,7 @@ async def _send_attendance_charts(
         img_path = await asyncio.to_thread(
             _draw_attendance_chart, attendance, date_str_jp, prog
         )
-        file = discord.File(img_path)
+        file = discord.File(img_path, filename=_chart_filename(message_id, idx))
         if send_mode == "channel":
             await out_ch.send(file=file)
         else:
@@ -1863,8 +1972,10 @@ async def cmd_remind(ctx: commands.Context, days_before: int | None = None) -> N
     """手動でリマインドを実行する。$remind または $remind 3"""
     days = [days_before] if days_before is not None else None
     await ctx.send("⏳ リマインドを実行します…")
-    await _run_reminder_job(days)
-    await ctx.send("✅ リマインド処理が完了しました。")
+    if await _run_reminder_job(days):
+        await ctx.send("✅ リマインド処理が完了しました。")
+    else:
+        await ctx.send("⚠️ リマインド処理の一部に失敗しました（通信エラーなど）。ログを確認してください。")
 
 
 @bot.command(name="outputtoday")
@@ -1872,8 +1983,10 @@ async def cmd_remind(ctx: commands.Context, days_before: int | None = None) -> N
 async def cmd_outputtoday(ctx: commands.Context) -> None:
     """手動で当日出欠表出力を実行する。"""
     await ctx.send("⏳ 当日の出欠表を出力します…")
-    await _run_daily_output_job()
-    await ctx.send("✅ 出力処理が完了しました。")
+    if await _run_daily_output_job():
+        await ctx.send("✅ 出力処理が完了しました。")
+    else:
+        await ctx.send("⚠️ 出力処理の一部に失敗しました（通信エラーなど）。ログを確認してください。")
 
 # ============================================================
 # その他ヘルパ
