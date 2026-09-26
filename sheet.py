@@ -140,6 +140,22 @@ _DATA_START_ROW = 3
 # -------------------------------------------------------------
 # 動的ヘッダビルド：プログラムごとに「_パート / _席次」を並べる
 # -------------------------------------------------------------
+def _row_key(row: List[str], heads: List[str]) -> str | None:
+    """
+    データ行を見分けるキー。Discord ID があれば 'id:<ID>'、無ければ
+    （サーバー未参加の人を手入力した行など）'name:<氏名 または 表示名>'。
+    完全な空行は None。
+    """
+    def cell(col: str) -> str:
+        i = heads.index(col)
+        return str(row[i]).strip() if i < len(row) else ""
+
+    if cell("Discord ID"):
+        return f"id:{cell('Discord ID')}"
+    name = cell("氏名") or cell("discord表示名")
+    return f"name:{name}" if name else None
+
+
 def _default_headers(programs: List[str]) -> List[str]:
     heads = ["discord表示名", "氏名", "Discord ID"]
     for prog in programs:
@@ -332,64 +348,89 @@ class GoogleSheetsManager:
                     return bool(colmeta[col - 1].get("hiddenByUser"))
             return False
 
-    def member_id_order(self) -> List[int]:
-        """データ行の並び順どおりの Discord ID リストを返す"""
+    def member_row_keys(self) -> List[str | None]:
+        """データ行の並び順どおりの行キー（_row_key）のリストを返す"""
         with self._lock:
-            self._refresh_index()
-            return [
-                mid for mid, _row in
-                sorted(self._member_to_row.items(), key=lambda kv: kv[1])
-            ]
+            heads = _default_headers(self.programs)
+            data = self.ws.get_values()[_DATA_START_ROW - 1:]
+            return [_row_key(r, heads) for r in data]
 
-    def realign_event_rows(self, id_order: List[int]) -> int:
+    def snapshot_event_rows(self) -> Dict[str, List[str]]:
         """
-        データ行のイベント列（固定列 A〜I より右）だけを id_order の
+        行キー（_row_key）→ その行のイベント列（固定列より右）の値。
+
+        分奏シートの並べ直し（realign_event_rows）用に、参照元の全奏を
+        並べ替える「前」に呼んでおく。並べ替えた後に読むと、分奏の固定列は
+        全奏参照で新しい並びに変わっているのにイベント列は古い並びのままなので、
+        行と出欠の対応が取れない。
+        """
+        with self._lock:
+            heads = _default_headers(self.programs)
+            n_fixed = len(heads)
+            data = self.ws.get_values()[_DATA_START_ROW - 1:]
+            snapshot: Dict[str, List[str]] = {}
+            for row in data:
+                key = _row_key(row, heads)
+                if key is not None and key not in snapshot:
+                    snapshot[key] = list(row[n_fixed:])
+            return snapshot
+
+    def realign_event_rows(
+        self,
+        key_order: List[str | None],
+        snapshot: Dict[str, List[str]],
+    ) -> int:
+        """
+        データ行のイベント列（固定列 A〜I より右）だけを key_order の
         行順に並べ替える。
 
-        固定列がARRAYFORMULA で別シート（全奏）を参照している分奏シート用。
+        固定列が ARRAYFORMULA で別シート（全奏）を参照している分奏シート用。
         メンバー行の並びは参照元のシートを並べ替えた瞬間に追従して変わるが、
-        イベント列は静的な値なので置いてけぼりになる。そこで各行の
-        イベント列の値を Discord ID で対応づけ、id_order（=参照元の
+        イベント列は静的な値なので置いてけぼりになる。そこで並べ替え前に
+        控えたイベント列（snapshot）を行キーで対応づけ、key_order（=参照元の
         新しい行順）と同じ並びに書き直して整合を保つ。
 
         入力
         ----
-        id_order : list[int]
-            参照元シートのデータ行順の Discord ID リスト
-            （member_id_order の返り値をそのまま渡す）
+        key_order : list[str | None]
+            参照元シートの並べ替え後の行キー（member_row_keys の返り値）
+        snapshot : dict[str, list[str]]
+            参照元を並べ替える前に snapshot_event_rows で控えたイベント列
 
         出力
         ----
-        int : id_order に対応づけて並べ替えたイベント行数
+        int : 行キーで対応づけて書き直したイベント行数
         """
         with self._lock:
             self._refresh_index()
             heads = _default_headers(self.programs)
             n_fixed = len(heads)
-            id_idx = heads.index("Discord ID")
 
             all_values = self.ws.get_values()
-            if len(all_values) < _DATA_START_ROW:
-                return 0
             data = all_values[_DATA_START_ROW - 1:]
-            width = max((len(r) for r in data), default=0)
+            width = max(
+                [len(r) for r in data] + [n_fixed + len(v) for v in snapshot.values()],
+                default=0,
+            )
             if width <= n_fixed:
                 return 0  # イベント列が無ければ何もしない
-            data = [r + [""] * (width - len(r)) for r in data]
+            n_events = width - n_fixed
 
-            blank = [""] * (width - n_fixed)
-            by_id: Dict[int, List[str]] = {}
-            for row in data:
-                try:
-                    mid = int(str(row[id_idx]).strip())
-                except ValueError:
-                    continue
-                by_id[mid] = row[n_fixed:]
+            def fit(values: List[str]) -> List[str]:
+                return (list(values) + [""] * n_events)[:n_events]
 
-            ordered = [by_id.pop(mid, list(blank)) for mid in id_order]
-            rows_out = ordered + list(by_id.values())  # 対応先が無い行は末尾へ
+            rest = dict(snapshot)
+            rows_out: List[List[str]] = []
+            matched = 0
+            for key in key_order:
+                if key is not None and key in rest:
+                    rows_out.append(fit(rest.pop(key)))
+                    matched += 1
+                else:
+                    rows_out.append([""] * n_events)
+            rows_out += [fit(v) for v in rest.values()]  # 対応先が無い行は末尾へ
             while len(rows_out) < len(data):  # 短くなった分は空行で上書き
-                rows_out.append(list(blank))
+                rows_out.append([""] * n_events)
 
             rng = (
                 f"{self._col_to_a1(n_fixed + 1)}{_DATA_START_ROW}:"
@@ -397,7 +438,7 @@ class GoogleSheetsManager:
             )
             self.ws.update(values=rows_out, range_name=rng)
             self._build_index()
-            return len(ordered)
+            return matched
 
     def sort_members_by_part(self, part_order: List[List[str]]) -> int:
         """
@@ -757,11 +798,18 @@ class GoogleSheetsManager:
         ----
         list[list[str]]
             _DATA_START_ROW 行目から last_row 行目までの、更新後のセル値
-            （gspread の update() にそのまま渡せる形）
+            （gspread の update() にそのまま渡せる形）。
+            Discord ID の無い行は今の値のまま、リアクションの無いメンバーは空欄
         """
-        write_values: List[List[str]] = [
-            [""] for _ in range(_DATA_START_ROW, last_row + 1)
-        ]
+        # Discord ID の無い行（サーバー未参加の人を手入力した行など）は、
+        # Bot がリアクションから出欠を知り得ないので、今の値をそのまま残す
+        member_rows = set(self._member_to_row.values())
+        write_values: List[List[str]] = []
+        for row in range(_DATA_START_ROW, last_row + 1):
+            keep = ""
+            if row not in member_rows and (row - 1) < len(current_col_values):
+                keep = str(current_col_values[row - 1])
+            write_values.append([keep])
 
         for member_id, new_status in values_by_member.items():
             row = self._member_to_row.get(member_id)
@@ -1104,13 +1152,19 @@ class SheetAsyncBridge:
         """GoogleSheetsManager.is_event_hidden を別スレッドで実行する"""
         return await asyncio.to_thread(self.gs.is_event_hidden, message_id)
 
-    async def member_id_order_async(self) -> List[int]:
-        """GoogleSheetsManager.member_id_order を別スレッドで実行する"""
-        return await asyncio.to_thread(self.gs.member_id_order)
+    async def member_row_keys_async(self) -> List[str | None]:
+        """GoogleSheetsManager.member_row_keys を別スレッドで実行する"""
+        return await asyncio.to_thread(self.gs.member_row_keys)
 
-    async def realign_event_rows_async(self, id_order: List[int]) -> int:
+    async def snapshot_event_rows_async(self) -> Dict[str, List[str]]:
+        """GoogleSheetsManager.snapshot_event_rows を別スレッドで実行する"""
+        return await asyncio.to_thread(self.gs.snapshot_event_rows)
+
+    async def realign_event_rows_async(
+        self, key_order: List[str | None], snapshot: Dict[str, List[str]]
+    ) -> int:
         """GoogleSheetsManager.realign_event_rows を別スレッドで実行する"""
-        return await asyncio.to_thread(self.gs.realign_event_rows, id_order)
+        return await asyncio.to_thread(self.gs.realign_event_rows, key_order, snapshot)
 
     async def set_resolved_bases_async(
         self,
