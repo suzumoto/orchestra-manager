@@ -661,16 +661,18 @@ async def _sort_and_realign_sheets() -> tuple[int, int]:
 
     分奏の固定列 A〜I は ARRAYFORMULA で全奏を参照しているため、
     メンバー情報の並びは全奏の並べ替えに自動追従する。一方で
-    分奏のイベント列（出欠データ）は静的な値なので、Discord ID で
-    対応づけて同じ並びに書き直す（realign_event_rows）。
+    分奏のイベント列（出欠データ）は静的な値なので、並べ替えの前に
+    控えておき、Discord ID（無い行は氏名）で対応づけて同じ並びに
+    書き直す（realign_event_rows）。
 
     Returns
     -------
     (全奏で並べ替えた行数, 分奏で追従させたイベント行数)
     """
+    snapshot = await sheet_bridge_bunsou.snapshot_event_rows_async()
     n_sorted = await sheet_bridge_ensou.sort_members_by_part_async(PART_SORT_ORDER)
-    id_order = await sheet_bridge_ensou.member_id_order_async()
-    n_realigned = await sheet_bridge_bunsou.realign_event_rows_async(id_order)
+    key_order = await sheet_bridge_ensou.member_row_keys_async()
+    n_realigned = await sheet_bridge_bunsou.realign_event_rows_async(key_order, snapshot)
     return n_sorted, n_realigned
 
 
