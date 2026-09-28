@@ -68,23 +68,28 @@ EMOJI_NAME = {
     "DM": config["EMOJI"]["dm"],
 }
 
-_ROLE_PATTERNS: list[tuple[re.Pattern[str], str]] = []
-
 if "PART_ROLE" not in config:
     raise RuntimeError(
         "settings.ini に [PART_ROLE] セクションが見つかりません。"
     )
 
-for part, regex_str in config["PART_ROLE"].items():
-    for pat in regex_str.split("|"):
-        pat = pat.strip()
-        if not pat:
-            continue
-        _ROLE_PATTERNS.append((re.compile(pat, re.I), part))
+
+def _parse_role_patterns(section: str) -> list[tuple[re.Pattern[str], str]]:
+    """[PART_ROLE] 形式のセクションを (ロール名の正規表現, パート名) のリストにする"""
+    patterns: list[tuple[re.Pattern[str], str]] = []
+    for part, regex_str in config[section].items():
+        for pat in regex_str.split("|"):
+            pat = pat.strip()
+            if not pat:
+                continue
+            patterns.append((re.compile(pat, re.I), part))
+    return patterns
+
 
 OUTPUT_ROLES = {v for v in config["ROLE"].values()}
 
-PROGRAMS = [v for _, v in config["PROGRAM"].items()]
+# [PROGRAM] が空なら曲ごとに分けず、全曲共通の 1 枚で出欠表を作る
+PROGRAMS = [v for _, v in config["PROGRAM"].items()] or ["全曲"]
 
 CHECKMARK_EMOJI = "✅"
 CANCEL_EMOJI = "🆖"
@@ -140,12 +145,49 @@ SPREADSHEET_ID = os.getenv("SPREADSHEET_ID")
 if not SPREADSHEET_ID:
     raise RuntimeError("環境変数 SPREADSHEET_ID が未設定です。")
 
-# シート名の設定（デフォルト: 全奏 / 分奏）
-ENSOU_SHEET_NAME = config["SPREADSHEET"].get(
-    "zensou_worksheet_name",
-    config["SPREADSHEET"].get("worksheet_name", "全奏"),
+_ss_cfg = config["SPREADSHEET"]
+
+# シート 1 = RSVP_channel_1 の出欠、シート 2 = RSVP_channel_2 の出欠
+# （旧来のキー名 zensou_ / bunsou_worksheet_name も読む。デフォルト: 全奏 / 分奏）
+ENSOU_SHEET_NAME = _ss_cfg.get(
+    "worksheet_1",
+    _ss_cfg.get("zensou_worksheet_name", _ss_cfg.get("worksheet_name", "全奏")),
 )
-BUNSOU_SHEET_NAME = config["SPREADSHEET"].get("bunsou_worksheet_name", "分奏")
+BUNSOU_SHEET_NAME = _ss_cfg.get(
+    "worksheet_2", _ss_cfg.get("bunsou_worksheet_name", "分奏")
+)
+
+# yes（既定）: 全奏/分奏方式。シート 2 の固定列はシート 1 を ARRAYFORMULA で
+#   参照し、メンバーはシート 1 にだけ登録する。投稿の日付行に『全奏』『分奏』が
+#   あればチャンネルよりそちらを優先して振り分ける。
+# no: 2 枚は独立したシート。メンバーもパートもシートごとに持ち、
+#   投稿はチャンネルだけで振り分ける。
+SHEET_2_MIRRORS_SHEET_1 = _ss_cfg.getboolean("mirror_sheet_2", fallback=True)
+
+# シートごとのパート判定（ロール名 → パート名）。
+# [PART_ROLE_2] が無ければシート 2 も [PART_ROLE] を使う。
+_ROLE_PATTERNS_BY_SHEET: dict[str, list[tuple[re.Pattern[str], str]]] = {
+    "ensou": _parse_role_patterns("PART_ROLE"),
+    "bunsou": _parse_role_patterns(
+        "PART_ROLE_2" if "PART_ROLE_2" in config else "PART_ROLE"
+    ),
+}
+
+# 独立シート方式で、パートのロールが無くてもそのシートの参加者とみなすロール名
+# （カンマ区切り）。例: パートが決まる前の人にも付いている参加者ロールなど。
+_MEMBER_ROLES_BY_SHEET: dict[str, set[str]] = {
+    key: {r.strip() for r in _member_cfg.get(opt, "").split(",") if r.strip()}
+    for key, opt in (("ensou", "member_roles_1"), ("bunsou", "member_roles_2"))
+}
+
+# シートごとのパート順（part_order_2 が無ければシート 2 も part_order を使う）
+PART_SORT_ORDER_BY_SHEET: dict[str, list[list[str]]] = {
+    "ensou": PART_SORT_ORDER,
+    "bunsou": (
+        _parse_part_order(_member_cfg["part_order_2"])
+        if "part_order_2" in _member_cfg else PART_SORT_ORDER
+    ),
+}
 
 # 全奏 / 分奏 それぞれのマネージャとブリッジ
 gs_manager_ensou = GoogleSheetsManager(
@@ -187,12 +229,14 @@ def _sheet_key_for_message(msg: discord.Message) -> str | None:
     決まる場合のみ従来どおりチャンネル名で振り分ける
     （settings.ini で同じチャンネルを両方に登録している場合は
     振り分け不能 = None とし、トップ練・連絡事項などは対象外にする）。
+    独立シート方式（mirror_sheet_2 = no）ではキーワードを見ず、チャンネルだけで決める。
     """
-    line = _find_date_line(msg.content or "")
-    if "分奏" in line:
-        return SHEET_KEY_BUNSOU
-    if "全奏" in line:
-        return SHEET_KEY_ENSOU
+    if SHEET_2_MIRRORS_SHEET_1:
+        line = _find_date_line(msg.content or "")
+        if "分奏" in line:
+            return SHEET_KEY_BUNSOU
+        if "全奏" in line:
+            return SHEET_KEY_ENSOU
 
     ch_name = str(msg.channel)
     in_ensou = ch_name in RSVP_CHANNELS_ENSOU
@@ -208,21 +252,44 @@ PRESENTATION_ID = os.getenv("SLIDES_PRESENTATION_ID")
 if not PRESENTATION_ID:
     raise RuntimeError("環境変数 SLIDES_PRESENTATION_ID が未設定です。")
 
-# スライドの座席を編集したら再起動で反映されるよう、起動のたびに Slides API から
-# 読み直す。API が使えないときだけ前回のキャッシュで起動する。
-_SLIDES_ARGS = dict(
-    presentation_id=PRESENTATION_ID,
-    credential_json=config["SLIDES"].get("credential_json", "credentials.json"),
-    slide_index=int(config["SLIDES"].get("slide_index", 1)),
-)
-try:
-    layout = SeatLayoutSlides(**_SLIDES_ARGS, use_slides=True)
-except Exception as exc:  # noqa: BLE001
-    print(f"[slides] 座席レイアウトを取得できなかったため、キャッシュを使います: {exc}")
-    layout = SeatLayoutSlides(**_SLIDES_ARGS, use_slides=False)
-LEGEND_COLOR = {
-    label: (info["fill"], info["font"])
-    for label, info in layout.legends.items()
+_slides_cfg = config["SLIDES"]
+# シートごとの座席スライド（0 始まりの番号）。slide_index_1 / _2 が無ければ
+# 両方とも slide_index を使う。
+_SLIDE_INDEX_1 = int(_slides_cfg.get("slide_index_1", _slides_cfg.get("slide_index", 1)))
+_SLIDE_INDEX_2 = int(_slides_cfg.get("slide_index_2", _slides_cfg.get("slide_index", 1)))
+
+
+def _load_layout(slide_index: int) -> SeatLayoutSlides:
+    """
+    スライドの座席を編集したら再起動で反映されるよう、起動のたびに Slides API から
+    読み直す。API が使えないときだけ前回のキャッシュで起動する。
+    """
+    args = dict(
+        presentation_id=PRESENTATION_ID,
+        credential_json=_slides_cfg.get("credential_json", "credentials.json"),
+        slide_index=slide_index,
+    )
+    try:
+        return SeatLayoutSlides(**args, use_slides=True)
+    except Exception as exc:  # noqa: BLE001
+        print(f"[slides] 座席レイアウト (slide {slide_index}) を取得できなかったため、キャッシュを使います: {exc}")
+        return SeatLayoutSlides(**args, use_slides=False)
+
+
+layout = _load_layout(_SLIDE_INDEX_1)
+if _SLIDE_INDEX_2 == _SLIDE_INDEX_1:
+    layout_2: SeatLayoutSlides | None = layout
+else:
+    # シート 2 の座席スライドが未整備でも、シート 1 の運用は止めない
+    try:
+        layout_2 = _load_layout(_SLIDE_INDEX_2)
+    except Exception as exc:  # noqa: BLE001
+        print(f"[slides] シート 2 の座席レイアウトを読めないため、シート 2 の出欠表画像は出力しません: {exc}")
+        layout_2 = None
+
+LAYOUT_BY_SHEET: dict[str, SeatLayoutSlides | None] = {
+    SHEET_KEY_ENSOU: layout,
+    SHEET_KEY_BUNSOU: layout_2,
 }
 
 # ------------------------------------------------------------
@@ -640,12 +707,32 @@ def _save_reaction_order(order: dict[tuple[int, int], list[str]]) -> None:
 # ============================================================
 # ロール名からパート推定
 # ============================================================
-def _detect_part_from_roles(member: discord.Member) -> str | None:
-    """Discord Member のロールからパート名を推定。該当無しなら None"""
-    for pattern, part in _ROLE_PATTERNS:
+def _detect_part_from_roles(
+    member: discord.Member, sheet_key: str = SHEET_KEY_ENSOU
+) -> str | None:
+    """Discord Member のロールから sheet_key のシートでのパート名を推定。該当無しなら None"""
+    for pattern, part in _ROLE_PATTERNS_BY_SHEET[sheet_key]:
         if any(pattern.match(role.name) for role in member.roles):
             return _canon_part(part)
     return None
+
+
+def _belongs_to_sheet(member: discord.Member, sheet_key: str) -> bool:
+    """そのシートのパートのロール、または member_roles_N のロールを持っているか"""
+    if _detect_part_from_roles(member, sheet_key):
+        return True
+    role_names = {r.name for r in member.roles}
+    return bool(role_names & _MEMBER_ROLES_BY_SHEET[sheet_key])
+
+
+def _member_sheet_keys(member: discord.Member) -> list[str]:
+    """
+    独立シート方式で、member を登録するシートのキー一覧を返す。
+    どちらのシートの参加者とも判定できない人は、取りこぼさないよう両方に登録する
+    （不要なら運営がシート上でパート・席次を消して対応する）。
+    """
+    keys = [k for k in (SHEET_KEY_ENSOU, SHEET_KEY_BUNSOU) if _belongs_to_sheet(member, k)]
+    return keys or [SHEET_KEY_ENSOU, SHEET_KEY_BUNSOU]
 
 
 # ============================================================
@@ -654,9 +741,12 @@ def _detect_part_from_roles(member: discord.Member) -> str | None:
 async def _sync_members_to_sheet(
     guild: discord.Guild,
     gs: GoogleSheetsManager,
+    sheet_key: str = SHEET_KEY_ENSOU,
 ) -> tuple[int, int]:
     """
     既存行は変更せず、新規メンバーだけを追加する。
+    独立シート方式では、sheet_key のシートに登録すべき人（_member_sheet_keys）だけを
+    対象にし、パートもそのシートの [PART_ROLE] で判定する。
     Returns
     -------
     added_with_part : int  … パート取得成功で追加した人数
@@ -694,7 +784,9 @@ async def _sync_members_to_sheet(
     for m in target_members:
         if m.bot or m.id in gs._member_to_row:
             continue
-        part_norm = _detect_part_from_roles(m)
+        if not SHEET_2_MIRRORS_SHEET_1 and sheet_key not in _member_sheet_keys(m):
+            continue
+        part_norm = _detect_part_from_roles(m, sheet_key)
         rows_to_append.append(_build_row(m, part_norm))
         if part_norm:
             added_with_part += 1
@@ -705,10 +797,33 @@ async def _sync_members_to_sheet(
     return added_with_part, added_no_part
 
 
+async def _sync_members_to_sheets(guild: discord.Guild) -> dict[str, tuple[int, int]]:
+    """
+    メンバーをシートへ同期し、追加があればパート順に並べ替える。
+    全奏/分奏方式ではメンバー情報のマスターであるシート 1 にだけ登録する
+    （シート 2 の固定列は ARRAYFORMULA による参照なので直接書き込まない）。
+
+    Returns
+    -------
+    {sheet_key: (パート判定ありで追加した人数, パート無しで追加した人数)}
+    """
+    targets = [(SHEET_KEY_ENSOU, gs_manager_ensou)]
+    if not SHEET_2_MIRRORS_SHEET_1:
+        targets.append((SHEET_KEY_BUNSOU, gs_manager_bunsou))
+    added = {
+        key: await _sync_members_to_sheet(guild, gs, key) for key, gs in targets
+    }
+    if any(sum(n) for n in added.values()):
+        await _sort_and_realign_sheets()
+    return added
+
+
 async def _sort_and_realign_sheets() -> tuple[int, int]:
     """
-    全奏シートをパート順に並べ替え、分奏シートのイベント列を
+    全奏/分奏方式: 全奏シートをパート順に並べ替え、分奏シートのイベント列を
     全奏の新しい行順に追従させる。
+    独立シート方式: 2 枚のシートをそれぞれのパート順で並べ替える
+    （戻り値は (シート 1 の行数, シート 2 の行数)）。
 
     分奏の固定列 A〜I は ARRAYFORMULA で全奏を参照しているため、
     メンバー情報の並びは全奏の並べ替えに自動追従する。一方で
@@ -720,6 +835,15 @@ async def _sort_and_realign_sheets() -> tuple[int, int]:
     -------
     (全奏で並べ替えた行数, 分奏で追従させたイベント行数)
     """
+    if not SHEET_2_MIRRORS_SHEET_1:
+        n_1 = await sheet_bridge_ensou.sort_members_by_part_async(
+            PART_SORT_ORDER_BY_SHEET[SHEET_KEY_ENSOU]
+        )
+        n_2 = await sheet_bridge_bunsou.sort_members_by_part_async(
+            PART_SORT_ORDER_BY_SHEET[SHEET_KEY_BUNSOU]
+        )
+        return n_1, n_2
+
     snapshot = await sheet_bridge_bunsou.snapshot_event_rows_async()
     n_sorted = await sheet_bridge_ensou.sort_members_by_part_async(PART_SORT_ORDER)
     key_order = await sheet_bridge_ensou.member_row_keys_async()
@@ -858,12 +982,8 @@ async def _startup_sync() -> None:
     """
     for g in bot.guilds:
         print(f"Syncing members for guild: {g.name}...")
-        # メンバー情報のマスターは全奏シート。分奏の固定列は
-        # ARRAYFORMULA による全奏参照なので直接書き込まない。
         try:
-            added = await _sync_members_to_sheet(g, gs_manager_ensou)
-            if any(added):
-                await _sort_and_realign_sheets()
+            await _sync_members_to_sheets(g)
         except Exception as exc:
             print(f"[startup-sync] member sync error ({g.name}): {exc}")
 
@@ -1145,7 +1265,7 @@ async def _run_daily_output_job(skip_sent: bool = False) -> bool:
                     guild=guild,
                     channel=msg.channel,
                     message_id=msg.id,
-                    bridge=bridge,
+                    sheet_key=sheet_key,
                     send_mode="channel",
                     member=None,
                     skip_sent_today=skip_sent,
@@ -1588,17 +1708,28 @@ async def _send_attendance_charts(
     guild: discord.Guild,
     channel: discord.TextChannel,
     message_id: int,
-    bridge: SheetAsyncBridge,
+    sheet_key: str,
     send_mode: str,
     member: discord.Member | None = None,
     skip_sent_today: bool = False,
 ) -> None:
     """
     対象メッセージの出欠表画像を各プログラム分生成して送信する。
+    出欠は sheet_key のシートから読み、そのシート用の座席スライドに描く。
     send_mode='channel' なら出力チャンネルへ、'dm' なら member へ DM。
     member はエラー通知先（None ならログ出力のみ）。
     skip_sent_today=True なら、今日すでに出力チャンネルへ送ったプログラムは送らない。
     """
+    seat_layout = LAYOUT_BY_SHEET[sheet_key]
+    if seat_layout is None:
+        msg_text = "❌ このシートの座席スライドが未整備のため、出欠表画像を作成できません。"
+        if member is not None:
+            await member.send(msg_text)
+        else:
+            print(f"[daily-output] {msg_text} (msg={message_id})")
+        return
+    bridge = _bridge_for_sheet_key(sheet_key)
+
     msg = await channel.fetch_message(message_id)
     date_str_jp = _format_date_jp(msg, with_weekday=True)
 
@@ -1634,7 +1765,7 @@ async def _send_attendance_charts(
             return
 
         img_path = await asyncio.to_thread(
-            _draw_attendance_chart, attendance, date_str_jp, prog
+            _draw_attendance_chart, seat_layout, attendance, date_str_jp, prog
         )
         file = discord.File(img_path, filename=_chart_filename(message_id, idx))
         if send_mode == "channel":
@@ -1650,7 +1781,7 @@ async def _handle_output_reaction(
     channel: discord.TextChannel,
     message_id: int,
     member: discord.Member,
-    bridge: SheetAsyncBridge,
+    sheet_key: str,
 ) -> None:
     """
     出力／DM リアクションを処理し、各プログラムの出欠画像を送信する。
@@ -1662,8 +1793,8 @@ async def _handle_output_reaction(
     guild, channel, message_id : 対象の RSVP メッセージを特定する情報
     member : discord.Member
         リアクションを押したメンバー（DM 送信先、エラー通知先）
-    bridge : SheetAsyncBridge
-        出欠データの取得元シート
+    sheet_key : str
+        出欠データの取得元シート（座席スライドの選択にも使う）
 
     出力
     ----
@@ -1674,7 +1805,7 @@ async def _handle_output_reaction(
         guild=guild,
         channel=channel,
         message_id=message_id,
-        bridge=bridge,
+        sheet_key=sheet_key,
         send_mode=send_mode,
         member=member,
     )
@@ -1752,7 +1883,7 @@ async def on_raw_reaction_add(
         channel=channel,
         message_id=message_id,
         member=member,
-        bridge=bridge,
+        sheet_key=sheet_key,
     )
 
 
@@ -1920,18 +2051,21 @@ async def append_prefix_cmd(
 @commands.has_any_role(*OUTPUT_ROLES)
 async def sync_members_cmd(ctx: commands.Context) -> None:
     """
-    ギルドメンバーのうち Sheets 未登録の人だけを全奏シートに追加する。
-    分奏シートのメンバー情報は全奏参照（ARRAYFORMULA）なので自動で追従する。
-    追加があった場合はパート順の並べ替えと分奏イベント列の追従も行う。
+    ギルドメンバーのうち Sheets 未登録の人だけをシートに追加する。
+    全奏/分奏方式では全奏シートにだけ追加し、分奏シートのメンバー情報は
+    全奏参照（ARRAYFORMULA）で自動追従する。独立シート方式では各シートに追加する。
+    追加があった場合はパート順の並べ替え（と分奏イベント列の追従）も行う。
     """
-    with_part, no_part = await _sync_members_to_sheet(ctx.guild, gs_manager_ensou)
-    if with_part + no_part > 0:
-        await _sort_and_realign_sheets()
-    await ctx.send(
-        f"✅ 同期完了: 追加 {with_part + no_part} 名 "
-        f"(パート判定あり {with_part} 名, パート無し {no_part} 名)\n"
-        f"※分奏シートは全奏参照のため自動反映"
-    )
+    added = await _sync_members_to_sheets(ctx.guild)
+    sheet_names = {SHEET_KEY_ENSOU: ENSOU_SHEET_NAME, SHEET_KEY_BUNSOU: BUNSOU_SHEET_NAME}
+    lines = [
+        f"{sheet_names[key]}: 追加 {with_part + no_part} 名 "
+        f"(パート判定あり {with_part} 名, パート無し {no_part} 名)"
+        for key, (with_part, no_part) in added.items()
+    ]
+    if SHEET_2_MIRRORS_SHEET_1:
+        lines.append(f"※{BUNSOU_SHEET_NAME}シートは{ENSOU_SHEET_NAME}参照のため自動反映")
+    await ctx.send("✅ 同期完了\n" + "\n".join(lines))
     await ctx.message.add_reaction("✅")
 
 
@@ -1941,15 +2075,14 @@ async def sync_members_cmd(ctx: commands.Context) -> None:
 )
 @commands.has_any_role(*OUTPUT_ROLES)
 async def sort_members_cmd(ctx: commands.Context) -> None:
-    """全奏シートをパート順に並べ替え、分奏のイベント列を追従させる"""
+    """全奏シートをパート順に並べ替え、分奏のイベント列を追従させる（独立シート方式なら各シートを並べ替える）"""
     msg = await ctx.send("🔄 パート順に並べ替え中...")
-    n_sorted, n_realigned = await _sort_and_realign_sheets()
-    await msg.edit(
-        content=(
-            f"✅ 並べ替え完了（全奏 {n_sorted} 行 / "
-            f"分奏イベント列の追従 {n_realigned} 行）"
-        )
-    )
+    n_1, n_2 = await _sort_and_realign_sheets()
+    if SHEET_2_MIRRORS_SHEET_1:
+        detail = f"{ENSOU_SHEET_NAME} {n_1} 行 / {BUNSOU_SHEET_NAME}イベント列の追従 {n_2} 行"
+    else:
+        detail = f"{ENSOU_SHEET_NAME} {n_1} 行 / {BUNSOU_SHEET_NAME} {n_2} 行"
+    await msg.edit(content=f"✅ 並べ替え完了（{detail}）")
     await ctx.message.add_reaction("✅")
 
 
@@ -1994,15 +2127,20 @@ async def cmd_outputtoday(ctx: commands.Context) -> None:
 # その他ヘルパ
 # ============================================================
 def _draw_attendance_chart(
+    seat_layout: SeatLayoutSlides,
     attendance: dict,
     date_str_jp: str,
     program_name: str,
 ) -> Path:
     """同期関数：draw.py を呼んで png を作る"""
-    drawer = PlayerBoxDrawer(layout)
+    drawer = PlayerBoxDrawer(seat_layout)
+    legend_color = {
+        label: (info["fill"], info["font"])
+        for label, info in seat_layout.legends.items()
+    }
 
     for (part, num, name), status in attendance.items():
-        if not part or (part, num) not in layout.seats:
+        if not part or (part, num) not in seat_layout.seats:
             continue
 
         # -------- ステータス解析 --------
@@ -2010,8 +2148,8 @@ def _draw_attendance_chart(
         has_leave = "早退" in status
 
         if has_late and has_leave:
-            fill_l, font_l = LEGEND_COLOR["遅刻"]
-            fill_r, font_r = LEGEND_COLOR["早退"]
+            fill_l, font_l = legend_color["遅刻"]
+            fill_r, font_r = legend_color["早退"]
             drawer.draw_playerbox_split(
                 part, num, name,
                 fill_left=fill_l,
@@ -2024,7 +2162,7 @@ def _draw_attendance_chart(
                 "早退" if has_leave else
                 _base_status(status)   # '出席' '欠席' '未回答'
             )
-            fill, font = LEGEND_COLOR.get(base, LEGEND_COLOR["未回答"])
+            fill, font = legend_color.get(base, legend_color["未回答"])
             drawer.draw_playerbox(part, num, name, fill, font)
 
     drawer.draw_program(date_str_jp, program_name)

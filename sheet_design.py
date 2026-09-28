@@ -108,6 +108,11 @@ _PART_COLORS = {
     "Timp":  "#D1C4E9",
     "Pf":    "#CFD8DC",
     "Hp":    "#F8BBD0",
+    # 合唱（ピンク〜ローズ系）
+    "Sop":   "#F48FB1",
+    "Alt":   "#F8BBD0",
+    "Ten":   "#CE93D8",
+    "Bass":  "#E1BEE7",
 }
 
 
