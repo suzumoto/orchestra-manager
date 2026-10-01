@@ -32,6 +32,7 @@ from sheet import (
     SheetTargetNotFoundError,
     _base_status,
     _default_headers,
+    part_header,
 )
 
 # ------------------------------------------------------------
@@ -88,8 +89,10 @@ def _parse_role_patterns(section: str) -> list[tuple[re.Pattern[str], str]]:
 
 OUTPUT_ROLES = {v for v in config["ROLE"].values()}
 
-# [PROGRAM] が空なら曲ごとに分けず、全曲共通の 1 枚で出欠表を作る
-PROGRAMS = [v for _, v in config["PROGRAM"].items()] or ["全曲"]
+# [PROGRAM] が空なら曲ごとに分けず、全曲共通の 1 枚で出欠表を作る。
+# その場合は名前の無いプログラム 1 つとして扱い、シートの見出しは
+# 『パート』『席次』になる（区分があれば『第一部_パート』のように付く）
+PROGRAMS = [v for _, v in config["PROGRAM"].items()] or [""]
 
 CHECKMARK_EMOJI = "✅"
 CANCEL_EMOJI = "🆖"
@@ -765,7 +768,7 @@ async def _sync_members_to_sheet(
         row[heads.index("Discord ID")] = str(member.id)
         if part_norm:
             for prog in gs.programs:
-                row[heads.index(f"{prog}_パート")] = part_norm
+                row[heads.index(part_header(prog))] = part_norm
         return row
 
     # sync_role が設定されていればロール保持者のみを対象にする
@@ -1963,9 +1966,10 @@ async def _confirm_overwrite(
         タイムアウト／キャンセルの場合は False
         （その場合、案内メッセージの編集まで済ませてある）。
     """
+    where = f"{error.program} で " if error.program else ""
     warn_msg = (
         f"{member.mention} さんは既に "
-        f"{error.program} で {error.prev_part}-{error.prev_num} として登録されています。\n"
+        f"{where}{error.prev_part}-{error.prev_num} として登録されています。\n"
         f"新しく {error.new_part}-{error.new_num} で上書きしてもよろしいですか？\n"
         f"{CHECKMARK_EMOJI}：上書きする  {CANCEL_EMOJI}：キャンセル（30 秒以内）"
     )
@@ -1996,17 +2000,29 @@ async def _confirm_overwrite(
 
 @bot.command(
     name="append",
-    help="$ append @member プログラム名 パート 席次",
+    help="$ append @member プログラム名 パート 席次"
+         "（プログラム未設定なら $ append @member パート 席次）",
 )
 @commands.has_any_role(*OUTPUT_ROLES)
 async def append_prefix_cmd(
     ctx: commands.Context,
     member: discord.Member,
-    program: str,
-    part: str,
-    num: int,
+    *args: str,
 ) -> None:
     """乗り番（パート・席次）を SpreadSheet に登録する（全奏のみ）"""
+    if len(args) == 2 and PROGRAMS == [""]:
+        program, (part, num_raw) = "", args
+    elif len(args) == 3:
+        program, part, num_raw = args
+    else:
+        await ctx.send(f"使い方: {ctx.command.help}")
+        return
+    try:
+        num = int(num_raw)
+    except ValueError:
+        await ctx.send(f"席次 '{num_raw}' は数字で指定してください。")
+        return
+
     if program not in PROGRAMS:
         await ctx.send(
             f"プログラム名 '{program}' は無効です。\n"
@@ -2169,7 +2185,8 @@ def _draw_attendance_chart(
 
     out_dir = Path("generated")
     out_dir.mkdir(exist_ok=True)
-    out_path = out_dir / f"attendance_{program_name}_{date_str_jp}.png"
+    stem = "_".join(s for s in ("attendance", program_name, date_str_jp) if s)
+    out_path = out_dir / f"{stem}.png"
     drawer.save(out_path)
     return out_path
 

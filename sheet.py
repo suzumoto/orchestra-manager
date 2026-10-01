@@ -156,10 +156,20 @@ def _row_key(row: List[str], heads: List[str]) -> str | None:
     return f"name:{name}" if name else None
 
 
+def part_header(program: str) -> str:
+    """パート列の見出し。曲区分なし（program が空）なら単に『パート』"""
+    return f"{program}_パート" if program else "パート"
+
+
+def num_header(program: str) -> str:
+    """席次列の見出し。曲区分なし（program が空）なら単に『席次』"""
+    return f"{program}_席次" if program else "席次"
+
+
 def _default_headers(programs: List[str]) -> List[str]:
     heads = ["discord表示名", "氏名", "Discord ID"]
     for prog in programs:
-        heads.extend([f"{prog}_パート", f"{prog}_席次"])
+        heads.extend([part_header(prog), num_header(prog)])
     return heads
 
 
@@ -479,8 +489,8 @@ class GoogleSheetsManager:
             self._refresh_index()
             heads = _default_headers(self.programs)
             disp_idx = heads.index("discord表示名")
-            part_idxs = [heads.index(f"{p}_パート") for p in self.programs]
-            num_idxs = [heads.index(f"{p}_席次") for p in self.programs]
+            part_idxs = [heads.index(part_header(p)) for p in self.programs]
+            num_idxs = [heads.index(num_header(p)) for p in self.programs]
 
             all_values = self.ws.get_values()
             if len(all_values) < _DATA_START_ROW:
@@ -682,9 +692,9 @@ class GoogleSheetsManager:
 
             for rec in records:
                 # ---- パート・席次・氏名 ---------------------------
-                part = str(rec.get(f"{program}_パート", "")).strip()
+                part = str(rec.get(part_header(program), "")).strip()
                 try:
-                    num = int(rec.get(f"{program}_席次", 0) or 0)
+                    num = int(rec.get(num_header(program), 0) or 0)
                 except (ValueError, TypeError):
                     num = 0
                 name = (
@@ -1004,8 +1014,8 @@ class GoogleSheetsManager:
                 row = self._member_to_row[member_id]
 
                 disp_col = heads.index("discord表示名") + 1
-                part_col = heads.index(f"{program}_パート") + 1
-                num_col = heads.index(f"{program}_席次") + 1
+                part_col = heads.index(part_header(program)) + 1
+                num_col = heads.index(num_header(program)) + 1
                 last_col = max(disp_col, part_col, num_col)
 
                 # 対象範囲を 1 回の読み取りでまとめて取得
@@ -1053,8 +1063,8 @@ class GoogleSheetsManager:
             new_row[heads.index("discord表示名")] = display_name
             new_row[heads.index("氏名")] = ""
             new_row[heads.index("Discord ID")] = str(member_id)
-            new_row[heads.index(f"{program}_パート")] = part
-            new_row[heads.index(f"{program}_席次")] = str(num)
+            new_row[heads.index(part_header(program))] = part
+            new_row[heads.index(num_header(program))] = str(num)
             self.ws.insert_row(new_row, index=self._next_data_row())
             self._build_index()
             return

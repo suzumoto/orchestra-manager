@@ -188,7 +188,7 @@ class PlayerBoxDrawer:
             # title_space が無い → 描画しない
             return
 
-        text = f"{date_str} {program_name}"
+        text = f"{date_str} {program_name}".strip()
         ul_x = title_box["center"][0] - title_box["size"][0] / 2
         cy = title_box["center"][1]
 
