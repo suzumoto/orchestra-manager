@@ -12,3 +12,5 @@ credentials.json
 reaction_order.json
 
 PLAN.md
+# 楽団のロゴは本番環境にだけ置く
+logo.jpg

@@ -176,6 +176,14 @@ _ROLE_PATTERNS_BY_SHEET: dict[str, list[tuple[re.Pattern[str], str]]] = {
     ),
 }
 
+# ロールでパートが決まらないときに使う、表示名（サーバーニックネーム）→ パート名の
+# 正規表現（[PART_NAME] / [PART_NAME_2]、任意）。名前の中のどこかに一致すればよい。
+# パートの判定にだけ使い、どのシートに登録するかはロールだけで決める。
+_NAME_PATTERNS_BY_SHEET: dict[str, list[tuple[re.Pattern[str], str]]] = {
+    key: _parse_role_patterns(section) if section in config else []
+    for key, section in (("ensou", "PART_NAME"), ("bunsou", "PART_NAME_2"))
+}
+
 # 独立シート方式で、パートのロールが無くてもそのシートの参加者とみなすロール名
 # （カンマ区切り）。例: パートが決まる前の人にも付いている参加者ロールなど。
 _MEMBER_ROLES_BY_SHEET: dict[str, set[str]] = {
@@ -720,6 +728,20 @@ def _detect_part_from_roles(
     return None
 
 
+def _detect_part(member: discord.Member, sheet_key: str = SHEET_KEY_ENSOU) -> str | None:
+    """
+    sheet_key のシートでのパート名を推定する。ロールを優先し、
+    ロールで決まらなければ表示名（[PART_NAME] / [PART_NAME_2]）から推定する。
+    """
+    part = _detect_part_from_roles(member, sheet_key)
+    if part:
+        return part
+    for pattern, name_part in _NAME_PATTERNS_BY_SHEET[sheet_key]:
+        if pattern.search(member.display_name):
+            return _canon_part(name_part)
+    return None
+
+
 def _belongs_to_sheet(member: discord.Member, sheet_key: str) -> bool:
     """そのシートのパートのロール、または member_roles_N のロールを持っているか"""
     if _detect_part_from_roles(member, sheet_key):
@@ -789,7 +811,7 @@ async def _sync_members_to_sheet(
             continue
         if not SHEET_2_MIRRORS_SHEET_1 and sheet_key not in _member_sheet_keys(m):
             continue
-        part_norm = _detect_part_from_roles(m, sheet_key)
+        part_norm = _detect_part(m, sheet_key)
         rows_to_append.append(_build_row(m, part_norm))
         if part_norm:
             added_with_part += 1
