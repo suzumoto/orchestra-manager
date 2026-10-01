@@ -32,6 +32,7 @@ from sheet import (
     SheetTargetNotFoundError,
     _base_status,
     _default_headers,
+    NAME_HEADER,
     part_header,
 )
 
@@ -786,7 +787,7 @@ async def _sync_members_to_sheet(
     def _build_row(member: discord.Member, part_norm: str | None) -> list[str]:
         row = [""] * len(heads)
         row[heads.index("discord表示名")] = member.display_name
-        row[heads.index("氏名")] = ""
+        row[heads.index(NAME_HEADER)] = ""
         row[heads.index("Discord ID")] = str(member.id)
         if part_norm:
             for prog in gs.programs:
@@ -853,7 +854,7 @@ async def _sort_and_realign_sheets() -> tuple[int, int]:
     分奏の固定列 A〜I は ARRAYFORMULA で全奏を参照しているため、
     メンバー情報の並びは全奏の並べ替えに自動追従する。一方で
     分奏のイベント列（出欠データ）は静的な値なので、並べ替えの前に
-    控えておき、Discord ID（無い行は氏名）で対応づけて同じ並びに
+    控えておき、Discord ID（無い行は名前）で対応づけて同じ並びに
     書き直す（realign_event_rows）。
 
     Returns

@@ -143,7 +143,7 @@ _DATA_START_ROW = 3
 def _row_key(row: List[str], heads: List[str]) -> str | None:
     """
     データ行を見分けるキー。Discord ID があれば 'id:<ID>'、無ければ
-    （サーバー未参加の人を手入力した行など）'name:<氏名 または 表示名>'。
+    （サーバー未参加の人を手入力した行など）'name:<名前 または 表示名>'。
     完全な空行は None。
     """
     def cell(col: str) -> str:
@@ -152,8 +152,12 @@ def _row_key(row: List[str], heads: List[str]) -> str | None:
 
     if cell("Discord ID"):
         return f"id:{cell('Discord ID')}"
-    name = cell("氏名") or cell("discord表示名")
+    name = cell(NAME_HEADER) or cell("discord表示名")
     return f"name:{name}" if name else None
+
+
+# 2 列目の見出し（ハンドルネームなど、表示名とは別に運営が管理する名前）
+NAME_HEADER = "名前"
 
 
 def part_header(program: str) -> str:
@@ -167,7 +171,7 @@ def num_header(program: str) -> str:
 
 
 def _default_headers(programs: List[str]) -> List[str]:
-    heads = ["discord表示名", "氏名", "Discord ID"]
+    heads = ["discord表示名", NAME_HEADER, "Discord ID"]
     for prog in programs:
         heads.extend([part_header(prog), num_header(prog)])
     return heads
@@ -691,14 +695,14 @@ class GoogleSheetsManager:
             header_key = self._col_to_header[col]
 
             for rec in records:
-                # ---- パート・席次・氏名 ---------------------------
+                # ---- パート・席次・名前 ---------------------------
                 part = str(rec.get(part_header(program), "")).strip()
                 try:
                     num = int(rec.get(num_header(program), 0) or 0)
                 except (ValueError, TypeError):
                     num = 0
                 name = (
-                    str(rec.get("氏名") or "").strip()
+                    str(rec.get(NAME_HEADER) or "").strip()
                     or str(rec.get("discord表示名") or "").strip()
                     or "???"
                 )
@@ -1061,7 +1065,7 @@ class GoogleSheetsManager:
             # ===== 新規行を追加 =====
             new_row = [""] * len(heads)
             new_row[heads.index("discord表示名")] = display_name
-            new_row[heads.index("氏名")] = ""
+            new_row[heads.index(NAME_HEADER)] = ""
             new_row[heads.index("Discord ID")] = str(member_id)
             new_row[heads.index(part_header(program))] = part
             new_row[heads.index(num_header(program))] = str(num)

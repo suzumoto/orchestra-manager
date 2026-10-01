@@ -26,7 +26,7 @@ import gspread
 
 # 列レイアウト（0-index）。sheet.py の _default_headers() と対応させること。
 _COL_DISCORD_ID = 2  # C: Discord ID（bot 専用 → 非表示）
-_FIXED_COLS = 3      # discord表示名 / 氏名 / Discord ID
+_FIXED_COLS = 3      # discord表示名 / 名前 / Discord ID
 
 
 # 日付ヘッダの表示形式（内部値は年込みの日付、表示は 'M月D日(曜)'）
@@ -113,6 +113,9 @@ _PART_COLORS = {
     "Alt":   "#F8BBD0",
     "Ten":   "#CE93D8",
     "Bass":  "#E1BEE7",
+    # 指揮・編曲（グレー系）
+    "Cond":  "#B0BEC5",
+    "Arr.":  "#ECEFF1",
 }
 
 
