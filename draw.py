@@ -82,6 +82,7 @@ class PlayerBoxDrawer:
         self.img = Image.new("RGB", CANVAS_SIZE, background_color)
         self.draw = ImageDraw.Draw(self.img)
 
+        self._draw_decorations()
         self._draw_logo()
         self._draw_legends()
         self._draw_conductor()
@@ -365,6 +366,26 @@ class PlayerBoxDrawer:
                             outline=BLACK, width=3)
         self.draw.text((cx, cy), "cond.",
                        font=COND_FONT, fill=BLACK, anchor="mm")
+
+    def _draw_decorations(self) -> None:
+        """
+        スライド上の囲み枠や見出しなど、座席・凡例以外の図形を、座席より先に描く
+        （スライドの重なり順。座席はこの上に描かれる）。
+        """
+        for d in getattr(self.seat_layout, "decorations", []):
+            cx, cy = d["center"]
+            w, h = d["size"]
+            box = (cx - w / 2, cy - h / 2, cx + w / 2, cy + h / 2)
+            if d.get("fill") is not None or d.get("outline") is not None:
+                self.draw.rectangle(
+                    box,
+                    fill=tuple(d["fill"]) if d.get("fill") is not None else None,
+                    outline=tuple(d["outline"]) if d.get("outline") is not None else None,
+                    width=max(1, round(d.get("outline_w") or 0)) if d.get("outline") is not None else 0,
+                )
+            if d.get("text"):
+                font = ImageFont.truetype("GenShinGothic-Medium.ttf", max(8, round(d.get("font_px") or 20)))
+                self.draw.text((cx, cy), d["text"], font=font, fill=tuple(d.get("font") or BLACK), anchor="mm")
 
     def _draw_legends(self) -> None:
         """

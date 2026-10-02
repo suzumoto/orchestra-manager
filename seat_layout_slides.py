@@ -43,6 +43,9 @@ class SeatLayoutSlides:
     self.conductor_pos : (x,y) | None
     self.logo_box : Optional[Dict]
     self.title_box : Optional[Dict]
+    self.decorations : [{'center','size','fill','outline','outline_w','text','font','font_px'}]
+        座席・凡例・タイトル枠・ロゴ枠のどれでもない、枠線・塗り・文字のある図形
+        （スライド上の囲み枠や見出しなど）。スライドの重なり順に並ぶ
     use_slides : bool, default False
         - False: 先にローカルキャッシュを探し、
                  無ければ Slides API から取得して保存
@@ -143,6 +146,10 @@ class SeatLayoutSlides:
             if data["title_box"] is not None
             else None
         )
+        self.decorations = [
+            {k: (tuple(v) if isinstance(v, list) else v) for k, v in d.items()}
+            for d in data.get("decorations", [])
+        ]
 
     def _save_to_cache(self) -> None:
         data = {
@@ -167,6 +174,10 @@ class SeatLayoutSlides:
                 if self.title_box is not None
                 else None
             ),
+            "decorations": [
+                {k: (list(v) if isinstance(v, tuple) else v) for k, v in d.items()}
+                for d in self.decorations
+            ],
         }
         with self._cache_path.open("w", encoding="utf-8") as fp:
             json.dump(data, fp, ensure_ascii=False, indent=2)
@@ -251,6 +262,66 @@ class SeatLayoutSlides:
             info["font"] = font_rgb
         return info
 
+    @staticmethod
+    def _theme_colors(pres: dict, slide: dict) -> Dict[str, Tuple[int, int, int]]:
+        """スライドのマスターのテーマ色（'DARK2' など）→ RGB"""
+        master_id = slide.get("slideProperties", {}).get("masterObjectId")
+        for master in pres.get("masters", []):
+            if master.get("objectId") != master_id:
+                continue
+            colors = master.get("pageProperties", {}).get("colorScheme", {}).get("colors", [])
+            return {c["type"]: _rgb_float_to_int(c.get("color", {})) for c in colors}
+        return {}
+
+    @staticmethod
+    def _resolve_color(color: dict, theme: Dict[str, Tuple[int, int, int]]
+                       ) -> Optional[Tuple[int, int, int]]:
+        """Slides の色指定（rgbColor / themeColor）→ RGB"""
+        if "rgbColor" in color:
+            return _rgb_float_to_int(color["rgbColor"])
+        if "themeColor" in color:
+            return theme.get(color["themeColor"])
+        return None
+
+    def _build_decoration(self, elem: dict, page_w_pt: float, page_h_pt: float,
+                          theme: Dict[str, Tuple[int, int, int]]) -> Optional[Dict]:
+        """枠線・塗り・文字のどれかが表示される図形を、飾りとして描くための情報にする"""
+        shape = elem.get("shape")
+        if not shape or "size" not in elem:
+            return None
+        props = shape.get("shapeProperties", {})
+
+        fill = None
+        bg = props.get("shapeBackgroundFill", {})
+        if bg.get("propertyState", "RENDERED") == "RENDERED" and "solidFill" in bg:
+            fill = self._resolve_color(bg["solidFill"].get("color", {}), theme)
+
+        outline, outline_w = None, 0.0
+        ol = props.get("outline", {})
+        if ol.get("propertyState", "RENDERED") == "RENDERED" and "outlineFill" in ol:
+            outline = self._resolve_color(ol["outlineFill"].get("solidFill", {}).get("color", {}), theme)
+            # ページの大きさ（page_h_pt）も線の太さも EMU で来る
+            outline_w = ol.get("weight", {}).get("magnitude", 0) * IMG_H / page_h_pt
+
+        text, font, font_px = "", (0, 0, 0), 0.0
+        for te in shape.get("text", {}).get("textElements", []):
+            run = te.get("textRun")
+            if not run:
+                continue
+            text += run.get("content", "")
+            if not font_px:
+                style = run.get("style", {})
+                font = self._resolve_color(style.get("foregroundColor", {}).get("opaqueColor", {}), theme) or (0, 0, 0)
+                font_px = style.get("fontSize", {}).get("magnitude", 14) * 12700 * IMG_H / page_h_pt  # pt → EMU → px
+        text = text.strip()
+
+        if fill is None and outline is None and not text:
+            return None
+        info = self._build_shape_info(elem, page_w_pt, page_h_pt)
+        info.update({"fill": fill, "outline": outline, "outline_w": outline_w,
+                     "text": text, "font": font, "font_px": font_px})
+        return info
+
     def _build_from_slides(
             self,
             presentation_id: str,
@@ -278,10 +349,18 @@ class SeatLayoutSlides:
         self.conductor_pos: Optional[Tuple[float, float]] = None
         self.logo_box: Optional[Dict] = None
         self.title_box: Optional[Dict] = None
+        self.decorations: list[Dict] = []
+        theme = self._theme_colors(pres, slide)
 
         for elem in slide["pageElements"]:
             label = self._extract_label(elem)
-            if not label:
+            if not label or not (
+                label in _LEGEND_SET or _PART_NUM_RE.match(label)
+                or label.lower() in ("logo_space", "title_space")
+            ):
+                deco = self._build_decoration(elem, page_w_pt, page_h_pt, theme)
+                if deco is not None:
+                    self.decorations.append(deco)
                 continue
 
             # ---------- 凡例（Legend） ----------
