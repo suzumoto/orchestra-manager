@@ -751,14 +751,21 @@ def _belongs_to_sheet(member: discord.Member, sheet_key: str) -> bool:
     return bool(role_names & _MEMBER_ROLES_BY_SHEET[sheet_key])
 
 
-def _member_sheet_keys(member: discord.Member) -> list[str]:
+def _member_sheet_keys(
+    member: discord.Member, registered_ids: set[int] = frozenset()
+) -> list[str]:
     """
     独立シート方式で、member を登録するシートのキー一覧を返す。
-    どちらのシートの参加者とも判定できない人は、取りこぼさないよう両方に登録する
-    （不要なら運営がシート上でパート・席次を消して対応する）。
+    どちらのシートの参加者とも判定できない人は、取りこぼさないよう両方に登録する。
+    ただし、その人がすでにどちらかのシートにいる（registered_ids に含まれる）なら
+    どこにも追加しない。運営が不要な側の行を消せば、それが維持される。
     """
     keys = [k for k in (SHEET_KEY_ENSOU, SHEET_KEY_BUNSOU) if _belongs_to_sheet(member, k)]
-    return keys or [SHEET_KEY_ENSOU, SHEET_KEY_BUNSOU]
+    if keys:
+        return keys
+    if member.id in registered_ids:
+        return []
+    return [SHEET_KEY_ENSOU, SHEET_KEY_BUNSOU]
 
 
 # ============================================================
@@ -768,11 +775,13 @@ async def _sync_members_to_sheet(
     guild: discord.Guild,
     gs: GoogleSheetsManager,
     sheet_key: str = SHEET_KEY_ENSOU,
+    registered_ids: set[int] = frozenset(),
 ) -> tuple[int, int]:
     """
     既存行は変更せず、新規メンバーだけを追加する。
     独立シート方式では、sheet_key のシートに登録すべき人（_member_sheet_keys）だけを
     対象にし、パートもそのシートの [PART_ROLE] で判定する。
+    registered_ids は同期を始める前にいずれかのシートにいた人の Discord ID。
     Returns
     -------
     added_with_part : int  … パート取得成功で追加した人数
@@ -810,7 +819,7 @@ async def _sync_members_to_sheet(
     for m in target_members:
         if m.bot or m.id in gs._member_to_row:
             continue
-        if not SHEET_2_MIRRORS_SHEET_1 and sheet_key not in _member_sheet_keys(m):
+        if not SHEET_2_MIRRORS_SHEET_1 and sheet_key not in _member_sheet_keys(m, registered_ids):
             continue
         part_norm = _detect_part(m, sheet_key)
         rows_to_append.append(_build_row(m, part_norm))
@@ -836,8 +845,15 @@ async def _sync_members_to_sheets(guild: discord.Guild) -> dict[str, tuple[int, 
     targets = [(SHEET_KEY_ENSOU, gs_manager_ensou)]
     if not SHEET_2_MIRRORS_SHEET_1:
         targets.append((SHEET_KEY_BUNSOU, gs_manager_bunsou))
+    # 運営がシートの行を足し引きしているかもしれないので読み直してから、
+    # 同期前の時点でどちらかのシートにいる人を控える
+    registered_ids: set[int] = set()
+    for _, gs in targets:
+        await asyncio.to_thread(gs._refresh_index)
+        registered_ids |= set(gs._member_to_row)
     added = {
-        key: await _sync_members_to_sheet(guild, gs, key) for key, gs in targets
+        key: await _sync_members_to_sheet(guild, gs, key, registered_ids)
+        for key, gs in targets
     }
     if any(sum(n) for n in added.values()):
         await _sort_and_realign_sheets()
