@@ -33,6 +33,7 @@ from sheet import (
     _base_status,
     _default_headers,
     NAME_HEADER,
+    norm_part_name,
     part_header,
 )
 
@@ -128,13 +129,29 @@ MEMBER_SYNC_ROLE = _member_cfg.get("sync_role", "").strip()
 
 
 def _parse_part_order(raw: str) -> list[list[str]]:
-    """'Fl/Picc, Ob/EHr, ...' 形式を別名グループのリストに変換する"""
+    """'Fl/Picc, Ob/EHr; Hr, ...' 形式を別名グループのリストに変換する（';' も ',' と同じ区切り）"""
     groups: list[list[str]] = []
-    for grp in raw.split(","):
+    for grp in raw.replace(";", ",").split(","):
         aliases = [a.strip() for a in grp.split("/") if a.strip()]
         if aliases:
             groups.append(aliases)
     return groups
+
+
+def _parse_part_sections(raw: str) -> dict[str, int] | None:
+    """
+    並び順の ';' で区切られたまとまりごとに、パート名（比較用キー）→ まとまり番号を返す。
+    ';' を使っていなければ None（パートの区切り線を引かない）。
+    """
+    if ";" not in raw:
+        return None
+    sections: dict[str, int] = {}
+    for i, sec in enumerate(raw.split(";")):
+        for grp in sec.split(","):
+            for alias in grp.split("/"):
+                if alias.strip():
+                    sections.setdefault(norm_part_name(alias), i)
+    return sections
 
 
 # シートの行並べ替えに使うパート順（'/' 区切りは同順位の別名）
@@ -200,6 +217,16 @@ PART_SORT_ORDER_BY_SHEET: dict[str, list[list[str]]] = {
         if "part_order_2" in _member_cfg else PART_SORT_ORDER
     ),
 }
+
+# パートのまとまり（並び順の ';' の区切り）ごとの横の太線。None のシートには引かない
+_PART_SECTIONS_BY_SHEET: dict[str, dict[str, int] | None] = {
+    "ensou": _parse_part_sections(_member_cfg.get("part_order", "")),
+    "bunsou": _parse_part_sections(
+        _member_cfg.get("part_order_2", _member_cfg.get("part_order", ""))
+    ),
+}
+# シートを手で直したとき（行の削除・パートの書き換えなど）に区切り線を追従させる確認間隔（分）
+SEPARATOR_CHECK_MINUTES = float(_member_cfg.get("separator_check_minutes", "10"))
 
 # 全奏 / 分奏 それぞれのマネージャとブリッジ
 gs_manager_ensou = GoogleSheetsManager(
@@ -884,13 +911,39 @@ async def _sort_and_realign_sheets() -> tuple[int, int]:
         n_2 = await sheet_bridge_bunsou.sort_members_by_part_async(
             PART_SORT_ORDER_BY_SHEET[SHEET_KEY_BUNSOU]
         )
+        await _redraw_part_separators()
         return n_1, n_2
 
     snapshot = await sheet_bridge_bunsou.snapshot_event_rows_async()
     n_sorted = await sheet_bridge_ensou.sort_members_by_part_async(PART_SORT_ORDER)
     key_order = await sheet_bridge_ensou.member_row_keys_async()
     n_realigned = await sheet_bridge_bunsou.realign_event_rows_async(key_order, snapshot)
+    await _redraw_part_separators()
     return n_sorted, n_realigned
+
+
+async def _redraw_part_separators(force: bool = False) -> None:
+    """
+    各シートのパートのまとまりの境目に横の太線を引き直す（位置が変わったシートだけ）。
+    罫線はセルの位置に残るので、並べ替え・行の追加削除・パートの書き換えのたびに必要。
+    書式だけの処理なので、失敗してもログに残して続行する。
+    """
+    for key, bridge in ((SHEET_KEY_ENSOU, sheet_bridge_ensou), (SHEET_KEY_BUNSOU, sheet_bridge_bunsou)):
+        sections = _PART_SECTIONS_BY_SHEET[key]
+        if sections is None:
+            continue
+
+        def section_of(part: str, sections: dict[str, int] = sections) -> tuple:
+            n = norm_part_name(part)
+            if not n:
+                return ("blank",)
+            return ("section", sections[n]) if n in sections else ("other", n)
+
+        try:
+            if await bridge.draw_part_separators_async(section_of, force):
+                print(f"[separator] {bridge.gs.ws.title} のパート区切り線を引き直しました")
+        except Exception as exc:  # noqa: BLE001
+            print(f"[separator] {bridge.gs.ws.title} の区切り線の更新に失敗: {exc}")
 
 
 # (message_id, member_id) → 現在有効な出欠リアクションの追加順リスト
@@ -1035,6 +1088,9 @@ async def _startup_sync() -> None:
         except Exception as exc:
             print(f"[startup-sync] RSVP sync error ({g.name}): {exc}")
 
+    # 停止中にシートが手で直されていても合うよう、起動時に一度引き直す
+    await _redraw_part_separators(force=True)
+
 
 # ============================================================
 # イベントハンドラ
@@ -1059,6 +1115,8 @@ async def on_ready() -> None:  # type: ignore[override]
         reminder_loop.start()
     if not daily_output_loop.is_running():
         daily_output_loop.start()
+    if not separator_loop.is_running() and any(_PART_SECTIONS_BY_SHEET.values()):
+        separator_loop.start()
 
     # 通信障害や再起動で予定時刻の実行を取りこぼしていたら、再試行の期限内なら取り戻す
     for name, job, scheduled in _SCHEDULED_JOBS:
@@ -1389,6 +1447,22 @@ async def daily_output_loop() -> None:
 @daily_output_loop.before_loop
 async def _before_daily_output_loop() -> None:
     await bot.wait_until_ready()
+
+
+@tasks.loop(minutes=SEPARATOR_CHECK_MINUTES)
+async def separator_loop() -> None:
+    """シートが手で直された（行の削除・パートの書き換えなど）ときに区切り線を追従させる"""
+    try:
+        await _redraw_part_separators()
+    except Exception as exc:
+        print(f"[separator] loop error: {exc}")
+
+
+@separator_loop.before_loop
+async def _before_separator_loop() -> None:
+    await bot.wait_until_ready()
+    # 起動直後は起動時同期のほうで引くので、1 周期待ってから見始める
+    await asyncio.sleep(SEPARATOR_CHECK_MINUTES * 60)
 
 
 async def _handle_dm_message(message: discord.Message) -> None:

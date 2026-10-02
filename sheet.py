@@ -4,13 +4,13 @@ from __future__ import annotations
 import asyncio
 import threading
 from datetime import date
-from typing import Dict, Tuple, List
+from typing import Callable, Dict, Hashable, Tuple, List
 import re
 
 import gspread
 from google.oauth2.service_account import Credentials
 
-from sheet_design import apply_design, date_header_format_request
+from sheet_design import apply_design, date_header_format_request, part_separator_requests
 
 # Google Sheets の日付シリアル値の起点
 _SHEETS_EPOCH = date(1899, 12, 30)
@@ -160,6 +160,11 @@ def _row_key(row: List[str], heads: List[str]) -> str | None:
 NAME_HEADER = "名前"
 
 
+def norm_part_name(name: str) -> str:
+    """パート名の比較用キー。大文字小文字・記号を無視する（'B.Cl' と 'bcl' は同じ）"""
+    return "".join(ch for ch in name.lower() if ch.isalnum())
+
+
 def part_header(program: str) -> str:
     """パート列の見出し。曲区分なし（program が空）なら単に『パート』"""
     return f"{program}_パート" if program else "パート"
@@ -221,6 +226,8 @@ class GoogleSheetsManager:
         self.programs: List[str] = programs or []
 
         self._lock = threading.Lock()
+        # 最後に引いたパート区切り線の位置（変わっていなければ引き直さない）
+        self._separator_sig: tuple | None = None
 
         # 空Sheetならヘッダ・メッセージ行を用意
         self._ensure_headers()
@@ -478,8 +485,7 @@ class GoogleSheetsManager:
         ----
         int : 並べ替え対象になったデータ行数
         """
-        def _norm(s: str) -> str:
-            return "".join(ch for ch in s.lower() if ch.isalnum())
+        _norm = norm_part_name
 
         rank_by_alias: Dict[str, int] = {}
         for rank, aliases in enumerate(part_order):
@@ -529,6 +535,48 @@ class GoogleSheetsManager:
             self.ws.update(values=data, range_name=rng)
             self._build_index()
             return len(data)
+
+    def draw_part_separators(
+        self, section_of: Callable[[str], Hashable], force: bool = False
+    ) -> bool:
+        """
+        パートのまとまりの境目に横の太線を引き直す。
+
+        入力
+        ----
+        section_of : (パート名) -> まとまりのキー
+            同じキーを返すパートが続く間は線を引かない
+        force : bool
+            True なら位置が前回と同じでも引き直す
+
+        出力
+        ----
+        bool : 引き直したら True（境目の位置が前回から変わっていなければ False）
+
+        行の並べ替えや追加・削除は値だけを動かし、罫線はセルの位置に残るため、
+        その都度ここで引き直す。パート列は最初のプログラムの列を見る。
+        """
+        with self._lock:
+            heads = _default_headers(self.programs)
+            part_idx = heads.index(part_header(self.programs[0]))
+            last_col = self._col_to_a1(len(heads))
+            rows = self.ws.get(f"A{_DATA_START_ROW}:{last_col}")
+            rows = [r + [""] * (len(heads) - len(r)) for r in rows]
+            keys = [section_of(r[part_idx].strip()) for r in rows]
+            bounds = [_DATA_START_ROW + i for i in range(1, len(keys)) if keys[i] != keys[i - 1]]
+            last_row = _DATA_START_ROW + len(rows) - 1
+
+            meta = self.sh.fetch_sheet_metadata({"fields": "sheets(properties(sheetId,gridProperties))"})
+            grid = next(s["properties"]["gridProperties"] for s in meta["sheets"]
+                        if s["properties"]["sheetId"] == self.ws.id)
+            sig = (tuple(bounds), last_row, grid["rowCount"], grid["columnCount"])
+            if not force and sig == self._separator_sig:
+                return False
+            self.sh.batch_update({"requests": part_separator_requests(
+                self.ws.id, grid["rowCount"], grid["columnCount"], bounds, last_row
+            )})
+            self._separator_sig = sig
+            return True
 
     def set_resolved_bases(
         self,
@@ -1161,6 +1209,12 @@ class SheetAsyncBridge:
     ) -> int:
         """GoogleSheetsManager.sort_members_by_part を別スレッドで実行する"""
         return await asyncio.to_thread(self.gs.sort_members_by_part, part_order)
+
+    async def draw_part_separators_async(
+        self, section_of: Callable[[str], Hashable], force: bool = False
+    ) -> bool:
+        """GoogleSheetsManager.draw_part_separators を別スレッドで実行する"""
+        return await asyncio.to_thread(self.gs.draw_part_separators, section_of, force)
 
     async def is_event_hidden_async(self, message_id: int) -> bool:
         """GoogleSheetsManager.is_event_hidden を別スレッドで実行する"""

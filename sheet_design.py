@@ -124,6 +124,42 @@ _PART_COLORS = {
 }
 
 
+_PART_SEPARATOR = {"style": "SOLID_THICK", "colorStyle": {"rgbColor": {}}}  # 黒の太線
+
+
+def part_separator_requests(
+    sheet_id: int,
+    n_rows: int,
+    n_cols: int,
+    boundary_rows: List[int],
+    last_row: int,
+) -> list[dict]:
+    """
+    パートのまとまりの境目に横の太線を引き直す batchUpdate リクエストを返す。
+
+    データ行（3 行目以降）の横線をいったんデザインの薄い罫線に戻してから、
+    boundary_rows（1-index、その行の上に線を引く）と最終データ行の下に太線を引く。
+    縦線・日付列との境界線には触れない。
+    """
+    thin = {"style": "SOLID", "color": _rgb(_GRID_LINE)}
+
+    def rows(r0: int, r1: int) -> dict:
+        return {"sheetId": sheet_id, "startRowIndex": r0 - 1, "endRowIndex": r1,
+                "startColumnIndex": 0, "endColumnIndex": n_cols}
+
+    req: list[dict] = [{"updateBorders": {
+        "range": rows(3, n_rows), "top": thin, "innerHorizontal": thin,
+        "bottom": {"style": "NONE"},
+    }}]
+    # 隣り合うセルの「上の行の下辺」と「下の行の上辺」の両方に引く
+    for r in boundary_rows:
+        req.append({"updateBorders": {"range": rows(r - 1, r - 1), "bottom": _PART_SEPARATOR}})
+        req.append({"updateBorders": {"range": rows(r, r), "top": _PART_SEPARATOR}})
+    if last_row >= 3:
+        req.append({"updateBorders": {"range": rows(last_row, last_row), "bottom": _PART_SEPARATOR}})
+    return req
+
+
 def build_design_requests(
     sheet_id: int,
     n_cols: int,
