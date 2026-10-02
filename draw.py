@@ -15,6 +15,9 @@ NAME_FONT = ImageFont.truetype("GenShinGothic-Medium.ttf", 24)
 PART_FONT = ImageFont.truetype("GenShinGothic-Medium.ttf", 20)
 COND_FONT = ImageFont.truetype("GenShinGothic-Medium.ttf", 28)
 PROGRAM_FONT = ImageFont.truetype("GenShinGothic-Medium.ttf", 30)
+# 名前が枠の幅に収まらないときに縮める下限の大きさと、枠の左右に残す余白（px）
+NAME_MIN_SIZE = 14
+NAME_PADDING = 4
 
 # -------- 絵文字（名前に含まれる 🍊 など） --------
 # 源真ゴシックには絵文字が無いので、絵文字の部分だけカラー絵文字フォントで描く。
@@ -110,7 +113,7 @@ class PlayerBoxDrawer:
 
         self.draw.rectangle((ul, lr), fill=fill_color,
                             outline=BLACK, width=2)
-        self._draw_seat_text(cx, cy, h, part, name, font_color)
+        self._draw_seat_text(cx, cy, w, h, part, name, font_color)
 
     # -------------------------------------------------
     # 左右 2 色分割 BOX を描く
@@ -152,7 +155,7 @@ class PlayerBoxDrawer:
         # 2) 外枠を最後に描画  ← これで 1 色 BOX とまったく同じ見た目
         self.draw.rectangle((ul, lr), outline=BLACK, width=2)
 
-        self._draw_seat_text(cx, cy, h, part, name, font_color)
+        self._draw_seat_text(cx, cy, w, h, part, name, font_color)
 
     def _seat_geometry(
         self, part: str, num: int
@@ -181,6 +184,7 @@ class PlayerBoxDrawer:
         self,
         cx: float,
         cy: float,
+        w: float,
         h: float,
         part: str,
         name: str,
@@ -191,8 +195,8 @@ class PlayerBoxDrawer:
 
         入力
         ----
-        cx, cy, h : float
-            BOX の中心座標と高さ（テキスト位置の計算に使う）
+        cx, cy, w, h : float
+            BOX の中心座標と幅・高さ（テキスト位置の計算と、名前を幅に収めるのに使う）
         part, name : str
             表示するパート名・奏者名
         font_color : tuple[int, int, int]
@@ -204,7 +208,8 @@ class PlayerBoxDrawer:
         """
         self.draw.text((cx, cy - h * 0.25), part,
                        font=PART_FONT, fill=font_color, anchor="mm")
-        self._draw_text_with_emoji(cx, cy + h * 0.25, name, NAME_FONT, font_color)
+        self._draw_text_with_emoji(cx, cy + h * 0.25, name, NAME_FONT, font_color,
+                                   max_width=w - NAME_PADDING * 2)
 
     def _draw_text_with_emoji(
         self,
@@ -213,10 +218,12 @@ class PlayerBoxDrawer:
         text: str,
         font: ImageFont.FreeTypeFont,
         fill: Tuple[int, int, int],
+        max_width: float | None = None,
     ) -> None:
         """
         (cx, cy) を中心に text を描く。絵文字の部分はカラー絵文字フォントで描き、
         文字の高さに合わせて縮めて並べる（絵文字フォントが無ければ絵文字は省く）。
+        max_width を超える場合は、収まる大きさまで文字を小さくする（下限 NAME_MIN_SIZE）。
         """
         runs: list[tuple[bool, str]] = []  # (絵文字か, 文字列)
         pos = 0
@@ -229,22 +236,29 @@ class PlayerBoxDrawer:
         if pos < len(text):
             runs.append((False, text[pos:]))
         runs = [(e, s.replace("️", "")) if not e else (e, s) for e, s in runs]
-        if not any(e for e, _ in runs):
-            self.draw.text((cx, cy), "".join(s for _, s in runs),
-                           font=font, fill=fill, anchor="mm")
-            return
 
-        emoji_h = font.size * 1.1
-        pieces: list[tuple[bool, str | Image.Image, float]] = []
-        for is_emoji, s in runs:
-            if not is_emoji:
-                pieces.append((False, s, font.getlength(s)))
-                continue
-            for cluster in _EMOJI_RE.findall(s) or [s]:
-                img = self._render_emoji(cluster, emoji_h)
-                if img is not None:
-                    pieces.append((True, img, img.width))
-        x = cx - sum(w for _, _, w in pieces) / 2
+        def layout(f: ImageFont.FreeTypeFont) -> list[tuple[bool, str | Image.Image, float]]:
+            pieces: list[tuple[bool, str | Image.Image, float]] = []
+            for is_emoji, s in runs:
+                if not is_emoji:
+                    pieces.append((False, s, f.getlength(s)))
+                    continue
+                for cluster in _EMOJI_RE.findall(s) or [s]:
+                    img = self._render_emoji(cluster, f.size * 1.1)
+                    if img is not None:
+                        pieces.append((True, img, img.width))
+            return pieces
+
+        pieces = layout(font)
+        width = sum(w for _, _, w in pieces)
+        # 枠からはみ出す名前は、収まる大きさまで文字を小さくする
+        while max_width and width > max_width and font.size > NAME_MIN_SIZE:
+            size = max(NAME_MIN_SIZE, min(font.size - 1, int(font.size * max_width / width)))
+            font = font.font_variant(size=size)
+            pieces = layout(font)
+            width = sum(w for _, _, w in pieces)
+
+        x = cx - width / 2
         for is_emoji, piece, w in pieces:
             if is_emoji:
                 self.img.paste(piece, (round(x), round(cy - piece.height / 2)), piece)
