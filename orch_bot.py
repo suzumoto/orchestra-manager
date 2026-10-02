@@ -10,6 +10,7 @@ sys.stderr.reconfigure(encoding="utf-8", errors="backslashreplace", line_bufferi
 
 import os
 import asyncio
+import random
 import re
 from collections.abc import Awaitable, Callable
 import json
@@ -225,8 +226,9 @@ _PART_SECTIONS_BY_SHEET: dict[str, dict[str, int] | None] = {
         _member_cfg.get("part_order_2", _member_cfg.get("part_order", ""))
     ),
 }
-# シートを手で直したとき（行の削除・パートの書き換えなど）に区切り線を追従させる確認間隔（分）
-SEPARATOR_CHECK_MINUTES = float(_member_cfg.get("separator_check_minutes", "10"))
+# シートを手で直したとき（行の削除・パートの書き換えなど）に区切り線を追従させる確認間隔（時間）。
+# 並べ替え・メンバー追加・再起動のときはこの間隔とは関係なくすぐ引き直す
+SEPARATOR_CHECK_HOURS = float(_member_cfg.get("separator_check_hours", "6"))
 
 # 全奏 / 分奏 それぞれのマネージャとブリッジ
 gs_manager_ensou = GoogleSheetsManager(
@@ -1449,10 +1451,27 @@ async def _before_daily_output_loop() -> None:
     await bot.wait_until_ready()
 
 
-@tasks.loop(minutes=SEPARATOR_CHECK_MINUTES)
+# 定期処理（リマインド・当日出力）の前後はどの Bot もシートを読むので、区切り線の確認は避ける
+_BUSY_MARGIN = timedelta(minutes=20)
+
+
+def _minutes_until_not_busy(now: datetime) -> float:
+    """now がリマインド・当日出力の予定時刻の前後 _BUSY_MARGIN 以内なら、抜けるまでの分数を返す"""
+    for t in (REMIND_TIME, OUTPUT_TIME):
+        scheduled = datetime.combine(now.date(), t)
+        for s in (scheduled - timedelta(days=1), scheduled, scheduled + timedelta(days=1)):
+            if s - _BUSY_MARGIN <= now <= s + _BUSY_MARGIN:
+                return (s + _BUSY_MARGIN - now).total_seconds() / 60
+    return 0.0
+
+
+@tasks.loop(hours=SEPARATOR_CHECK_HOURS)
 async def separator_loop() -> None:
     """シートが手で直された（行の削除・パートの書き換えなど）ときに区切り線を追従させる"""
     try:
+        wait_min = _minutes_until_not_busy(datetime.now(JST))
+        if wait_min > 0:
+            await asyncio.sleep(wait_min * 60)
         await _redraw_part_separators()
     except Exception as exc:
         print(f"[separator] loop error: {exc}")
@@ -1461,8 +1480,9 @@ async def separator_loop() -> None:
 @separator_loop.before_loop
 async def _before_separator_loop() -> None:
     await bot.wait_until_ready()
-    # 起動直後は起動時同期のほうで引くので、1 周期待ってから見始める
-    await asyncio.sleep(SEPARATOR_CHECK_MINUTES * 60)
+    # 起動直後は起動時同期のほうで引く。最初の確認までの待ち時間を起動ごとにランダムにして、
+    # 同じコードの Bot が複数動いていても確認の時刻がそろわないようにする
+    await asyncio.sleep(random.uniform(0.5, 1.0) * SEPARATOR_CHECK_HOURS * 3600)
 
 
 async def _handle_dm_message(message: discord.Message) -> None:

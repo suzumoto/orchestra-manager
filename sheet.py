@@ -555,6 +555,7 @@ class GoogleSheetsManager:
 
         行の並べ替えや追加・削除は値だけを動かし、罫線はセルの位置に残るため、
         その都度ここで引き直す。パート列は最初のプログラムの列を見る。
+        変化が無ければ読み取り 1 回で終わる（シートの大きさは引き直すときだけ取得する）。
         """
         with self._lock:
             heads = _default_headers(self.programs)
@@ -566,12 +567,12 @@ class GoogleSheetsManager:
             bounds = [_DATA_START_ROW + i for i in range(1, len(keys)) if keys[i] != keys[i - 1]]
             last_row = _DATA_START_ROW + len(rows) - 1
 
+            sig = (tuple(bounds), last_row)
+            if not force and sig == self._separator_sig:
+                return False
             meta = self.sh.fetch_sheet_metadata({"fields": "sheets(properties(sheetId,gridProperties))"})
             grid = next(s["properties"]["gridProperties"] for s in meta["sheets"]
                         if s["properties"]["sheetId"] == self.ws.id)
-            sig = (tuple(bounds), last_row, grid["rowCount"], grid["columnCount"])
-            if not force and sig == self._separator_sig:
-                return False
             self.sh.batch_update({"requests": part_separator_requests(
                 self.ws.id, grid["rowCount"], grid["columnCount"], bounds, last_row
             )})
