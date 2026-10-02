@@ -10,6 +10,7 @@ sys.stderr.reconfigure(encoding="utf-8", errors="backslashreplace", line_bufferi
 
 import os
 import asyncio
+import io
 import random
 import re
 from collections.abc import Awaitable, Callable
@@ -25,6 +26,13 @@ from gspread.exceptions import APIError
 load_dotenv()
 
 from draw import PlayerBoxDrawer, BLACK
+
+# お知らせ（リマインド・時刻確認）のウィンドウ画像。読み込めなければ文字だけで送る
+try:
+    import message_window
+except Exception as _exc:  # noqa: BLE001
+    print(f"[window] お知らせの画像を作れないため、文字だけで送ります: {_exc}")
+    message_window = None
 from seat_layout_slides import SeatLayoutSlides
 from sheet import (
     GoogleSheetsManager,
@@ -676,11 +684,15 @@ async def _post_time_input_button(
             return
 
     verb = "到着" if status == "遅刻" else "退出"
-    content = (
-        f"⏰ {member.mention} さん、{date_str_jp}の練習に{status}の予定ですね。"
-        f"下のボタンから{verb}予定時刻を入力してください。\n"
-        f"時刻を間違えたときは、もう一度ボタンを押して入力し直せば上書きされます。"
-    )
+    window = await _window_file("time_input_window", date_str_jp, status, filename="time_input.png")
+    if window is not None:
+        content = member.mention
+    else:
+        content = (
+            f"⏰ {member.mention} さん、{date_str_jp}の練習に{status}の予定ですね。"
+            f"下のボタンから{verb}予定時刻を入力してください。\n"
+            f"時刻を間違えたときは、もう一度ボタンを押して入力し直せば上書きされます。"
+        )
     view = discord.ui.View(timeout=None)
     view.add_item(
         TimeInputButton(
@@ -692,9 +704,30 @@ async def _post_time_input_button(
     )
 
     try:
-        await thread.send(content, view=view)
+        if window is not None:
+            await thread.send(content, file=window, view=view)
+        else:
+            await thread.send(content, view=view)
     except discord.HTTPException as exc:
         print(f"[time-input] スレッドへのボタン投稿に失敗: {exc}")
+
+
+async def _window_file(builder: str, *args: object, filename: str) -> discord.File | None:
+    """
+    message_window.<builder>(*args) でお知らせのウィンドウ画像を作り、添付ファイルにして返す。
+    作れなかったときは None（呼び出し側は文字だけのメッセージで送る）。
+    """
+    if message_window is None:
+        return None
+    try:
+        img = await asyncio.to_thread(getattr(message_window, builder), *args)
+        buf = io.BytesIO()
+        await asyncio.to_thread(img.save, buf, "PNG")
+        buf.seek(0)
+        return discord.File(buf, filename=filename)
+    except Exception as exc:  # noqa: BLE001
+        print(f"[window] お知らせの画像を作れなかったため、文字だけで送ります: {exc}")
+        return None
 
 
 async def _setup_hook() -> None:
@@ -1292,18 +1325,31 @@ async def _send_reminder_for_post(
     mentions = " ".join(m.mention for m in non_responders)
     label = "前日" if days_before == 1 else f"{days_before}日前"
 
-    content = (
-        f"📢 **出欠リマインド（練習{label}）**\n"
-        f"{practice_date.month}月{practice_date.day}日の練習の出欠が未回答です。\n"
-        f"こちらの投稿にリアクションで回答してください → {msg.jump_url}\n"
-        f"(Cc: {role_mention})\n\n"
-        f"{mentions}"
+    window = await _window_file(
+        "reminder_window", practice_date.month, practice_date.day, days_before,
+        filename="reminder.png",
     )
+    if window is not None:
+        content = (
+            f"回答はこちらの投稿へ → {msg.jump_url}\n"
+            f"(Cc: {role_mention})\n\n"
+            f"{mentions}"
+        )
+    else:
+        content = (
+            f"📢 **出欠リマインド（練習{label}）**\n"
+            f"{practice_date.month}月{practice_date.day}日の練習の出欠が未回答です。\n"
+            f"こちらの投稿にリアクションで回答してください → {msg.jump_url}\n"
+            f"(Cc: {role_mention})\n\n"
+            f"{mentions}"
+        )
+    extra = {"file": window} if window is not None else {}
     await thread.send(
         content,
         allowed_mentions=discord.AllowedMentions(
             users=True, roles=True, everyone=False
         ),
+        **extra,
     )
     print(f"[reminder] sent to {thread.name} ({len(non_responders)} members)")
 
