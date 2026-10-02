@@ -4,16 +4,54 @@ SeatLayoutSlides の情報を使って
 座席と凡例を“スライド通りの位置・サイズ・色”で描画する
 """
 
+import re
 from pathlib import Path
 from typing import Tuple
 
-from PIL import Image, ImageDraw, ImageFont
+from PIL import Image, ImageDraw, ImageFont, features
 
 # -------- フォント --------
 NAME_FONT = ImageFont.truetype("GenShinGothic-Medium.ttf", 24)
 PART_FONT = ImageFont.truetype("GenShinGothic-Medium.ttf", 20)
 COND_FONT = ImageFont.truetype("GenShinGothic-Medium.ttf", 28)
 PROGRAM_FONT = ImageFont.truetype("GenShinGothic-Medium.ttf", 30)
+
+# -------- 絵文字（名前に含まれる 🍊 など） --------
+# 源真ゴシックには絵文字が無いので、絵文字の部分だけカラー絵文字フォントで描く。
+# フォントは見つかった最初のものを使う（リポジトリには含めない）。
+# Raspberry Pi などの Debian 系: sudo apt install fonts-noto-color-emoji
+_EMOJI_FONT_PATHS = (
+    "NotoColorEmoji.ttf",
+    "/usr/share/fonts/truetype/noto/NotoColorEmoji.ttf",
+    "/usr/share/fonts/noto/NotoColorEmoji.ttf",
+    r"C:\Windows\Fonts\seguiemj.ttf",
+    "/System/Library/Fonts/Apple Color Emoji.ttc",
+)
+# Noto Color Emoji はこのサイズのビットマップしか持たないため、この大きさで描いて縮める
+_EMOJI_RENDER_SIZE = 109
+_EMOJI_RE = re.compile(
+    "(?:[\U0001F000-\U0001FAFF\u2600-\u27BF\u2B00-\u2BFF\u2300-\u23FF]"
+    "[\uFE0F\U0001F3FB-\U0001F3FF]*"
+    "(?:\u200D[\U0001F000-\U0001FAFF\u2600-\u27BF][\uFE0F\U0001F3FB-\U0001F3FF]*)*)+"
+)
+
+
+# 肌の色・ZWJ でつないだ絵文字・国旗を 1 つにまとめて描くには Raqm が要る
+_HAS_RAQM = features.check("raqm")
+
+
+def _load_emoji_font() -> ImageFont.FreeTypeFont | None:
+    engine = ImageFont.Layout.RAQM if _HAS_RAQM else ImageFont.Layout.BASIC
+    for path in _EMOJI_FONT_PATHS:
+        try:
+            return ImageFont.truetype(path, _EMOJI_RENDER_SIZE, layout_engine=engine)
+        except OSError:
+            continue
+    print("[draw] カラー絵文字フォントが見つからないため、名前の絵文字は描画しません")
+    return None
+
+
+EMOJI_FONT = _load_emoji_font()
 
 BLACK = (0, 0, 0)
 WHITE = (255, 255, 255)
@@ -166,8 +204,71 @@ class PlayerBoxDrawer:
         """
         self.draw.text((cx, cy - h * 0.25), part,
                        font=PART_FONT, fill=font_color, anchor="mm")
-        self.draw.text((cx, cy + h * 0.25), name,
-                       font=NAME_FONT, fill=font_color, anchor="mm")
+        self._draw_text_with_emoji(cx, cy + h * 0.25, name, NAME_FONT, font_color)
+
+    def _draw_text_with_emoji(
+        self,
+        cx: float,
+        cy: float,
+        text: str,
+        font: ImageFont.FreeTypeFont,
+        fill: Tuple[int, int, int],
+    ) -> None:
+        """
+        (cx, cy) を中心に text を描く。絵文字の部分はカラー絵文字フォントで描き、
+        文字の高さに合わせて縮めて並べる（絵文字フォントが無ければ絵文字は省く）。
+        """
+        runs: list[tuple[bool, str]] = []  # (絵文字か, 文字列)
+        pos = 0
+        for m in _EMOJI_RE.finditer(text):
+            if m.start() > pos:
+                runs.append((False, text[pos:m.start()]))
+            if EMOJI_FONT is not None:
+                runs.append((True, m.group()))
+            pos = m.end()
+        if pos < len(text):
+            runs.append((False, text[pos:]))
+        runs = [(e, s.replace("️", "")) if not e else (e, s) for e, s in runs]
+        if not any(e for e, _ in runs):
+            self.draw.text((cx, cy), "".join(s for _, s in runs),
+                           font=font, fill=fill, anchor="mm")
+            return
+
+        emoji_h = font.size * 1.1
+        pieces: list[tuple[bool, str | Image.Image, float]] = []
+        for is_emoji, s in runs:
+            if not is_emoji:
+                pieces.append((False, s, font.getlength(s)))
+                continue
+            for cluster in _EMOJI_RE.findall(s) or [s]:
+                img = self._render_emoji(cluster, emoji_h)
+                if img is not None:
+                    pieces.append((True, img, img.width))
+        x = cx - sum(w for _, _, w in pieces) / 2
+        for is_emoji, piece, w in pieces:
+            if is_emoji:
+                self.img.paste(piece, (round(x), round(cy - piece.height / 2)), piece)
+            else:
+                self.draw.text((x, cy), piece, font=font, fill=fill, anchor="lm")
+            x += w
+
+    @staticmethod
+    def _render_emoji(cluster: str, height: float) -> Image.Image | None:
+        """絵文字 1 つをカラーで描き、余白を切り落として高さ height に縮めた RGBA 画像を返す"""
+        if not _HAS_RAQM:
+            # まとめて描けないので、崩れないよう先頭の基本の絵文字だけにする（👍🏽→👍、👨‍👩‍👧→👨）
+            cluster = re.sub("[🏻-🏿️]", "", cluster.split("‍")[0])
+        size = _EMOJI_RENDER_SIZE * 3
+        canvas = Image.new("RGBA", (size, size), (0, 0, 0, 0))
+        ImageDraw.Draw(canvas).text((size / 2, size / 2), cluster, font=EMOJI_FONT,
+                                    embedded_color=True, anchor="mm")
+        bbox = canvas.getbbox()
+        if bbox is None:
+            return None
+        canvas = canvas.crop(bbox)
+        scale = height / canvas.height
+        return canvas.resize((max(1, round(canvas.width * scale)), max(1, round(height))),
+                             Image.Resampling.LANCZOS)
 
     # -------------------------------------------------
     # 日付とプログラム名を描画
