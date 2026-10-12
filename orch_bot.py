@@ -254,6 +254,13 @@ gs_manager_bunsou = GoogleSheetsManager(
 sheet_bridge_ensou = SheetAsyncBridge(gs_manager_ensou)
 sheet_bridge_bunsou = SheetAsyncBridge(gs_manager_bunsou)
 
+# 回答が無ければ「出席」扱いにするパート（指揮者など）。Discord で回答すればそちらが優先され、
+# 回答を全部外すと「出席」に戻る。リマインドの対象にもならない
+for _gs, _opt in ((gs_manager_ensou, "default_attend_parts_1"), (gs_manager_bunsou, "default_attend_parts_2")):
+    _gs.default_attend_parts = {
+        norm_part_name(p) for p in _member_cfg.get(_opt, "").split(",") if p.strip()
+    }
+
 # シートキーの定義
 SHEET_KEY_ENSOU = "ensou"
 SHEET_KEY_BUNSOU = "bunsou"
@@ -1189,6 +1196,8 @@ async def _handle_rsvp_post(message: discord.Message) -> None:
     await bridge.add_event_column_async(
         header_str, message.id, _get_event_date_iso(message)
     )
+    # 回答が無ければ出席扱いのメンバー（指揮者など）は「出席」で埋めておく
+    await bridge.fill_default_attend_async(message.id)
 
 
 # ============================================================
@@ -1236,6 +1245,8 @@ async def _compute_non_responders(
     """シート登録メンバーのうち、msg に出欠リアクションをしていない人を返す"""
     bridge = _bridge_for_sheet_key(sheet_key)
     registered = await bridge.registered_member_ids_async()
+    # 回答が無ければ出席扱いのメンバー（指揮者など）には催促しない
+    registered -= await bridge.default_attend_member_ids_async()
     reacted = set(await _collect_attendance_from_reactions(msg))
     members: list[discord.Member] = []
     for uid in registered - reacted:

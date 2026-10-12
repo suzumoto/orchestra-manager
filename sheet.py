@@ -228,6 +228,8 @@ class GoogleSheetsManager:
         self._lock = threading.Lock()
         # 最後に引いたパート区切り線の位置（変わっていなければ引き直さない）
         self._separator_sig: tuple | None = None
+        # 回答が無ければ「出席」扱いにするパート（norm_part_name 済み）。呼び出し側が設定する
+        self.default_attend_parts: set[str] = set()
 
         # 空Sheetならヘッダ・メッセージ行を用意
         self._ensure_headers()
@@ -340,6 +342,55 @@ class GoogleSheetsManager:
         with self._lock:
             self._refresh_index()
             return set(self._member_to_row.keys())
+
+    # ------------------------------------------------------------------
+    # 回答が無ければ出席扱いのメンバー（指揮者など。default_attend_parts のパート）
+    # ------------------------------------------------------------------
+    def _part_col(self) -> int:
+        """パート列（最初のプログラム）の列番号（1-index）"""
+        heads = _default_headers(self.programs)
+        return heads.index(part_header(self.programs[0])) + 1
+
+    def _is_default_attend(self, part: str) -> bool:
+        return bool(self.default_attend_parts) and norm_part_name(part) in self.default_attend_parts
+
+    def default_attend_member_ids(self) -> set[int]:
+        """回答が無ければ出席扱いのメンバーの Discord ID（リマインドの対象から外す）"""
+        if not self.default_attend_parts:
+            return set()
+        with self._lock:
+            self._refresh_index()
+            parts = self.ws.col_values(self._part_col())
+            return {
+                mid for mid, row in self._member_to_row.items()
+                if row - 1 < len(parts) and self._is_default_attend(parts[row - 1])
+            }
+
+    def fill_default_attend(self, message_id: int) -> int:
+        """
+        message_id の列で、出席扱いのメンバーのセルが空欄なら「出席」を入れる
+        （新しい練習の列を作ったときに呼ぶ）。書き込んだセルの数を返す。
+        """
+        if not self.default_attend_parts:
+            return 0
+        with self._lock:
+            self._refresh_index()
+            col = self._msgid_to_col.get(message_id)
+            if col is None:
+                return 0
+            ev_a1, part_a1 = self._col_to_a1(col), self._col_to_a1(self._part_col())
+            ev, parts = self.ws.batch_get([f"{ev_a1}1:{ev_a1}", f"{part_a1}1:{part_a1}"])
+            ev = [r[0] if r else "" for r in ev]
+            parts = [r[0] if r else "" for r in parts]
+            cells = []
+            for row in self._member_to_row.values():
+                part = parts[row - 1] if row - 1 < len(parts) else ""
+                cur = ev[row - 1] if row - 1 < len(ev) else ""
+                if self._is_default_attend(part) and not str(cur).strip():
+                    cells.append({"range": f"{ev_a1}{row}", "values": [["出席"]]})
+            if cells:
+                self.ws.batch_update(cells)
+            return len(cells)
 
     def is_event_hidden(self, message_id: int) -> bool:
         """
@@ -613,7 +664,9 @@ class GoogleSheetsManager:
             row = self._member_to_row[member_id]
 
             if not bases:
-                new_val = ""
+                # 出席扱いのメンバーがリアクションを全部外したら「出席」に戻す
+                part = self.ws.cell(row, self._part_col()).value if self.default_attend_parts else ""
+                new_val = "出席" if self._is_default_attend(part or "") else ""
             elif bases[0] in ("出席", "欠席"):
                 new_val = bases[0]
             else:
@@ -827,15 +880,28 @@ class GoogleSheetsManager:
             if last_row < _DATA_START_ROW:
                 return
 
-            # 現在の列の値を一括取得（時刻情報の保持用）
-            # col_values は 0-index のリスト (row 1 が index 0)
-            current_col_values = self.ws.col_values(col)
+            # 現在の列の値を一括取得（時刻情報の保持用）。出席扱いのパートがあれば
+            # パート列も同じ呼び出しで読む。どちらも 0-index のリスト (row 1 が index 0)
+            col_a1 = self._col_to_a1(col)
+            if self.default_attend_parts:
+                part_a1 = self._col_to_a1(self._part_col())
+                ev, parts = self.ws.batch_get([f"{col_a1}1:{col_a1}", f"{part_a1}1:{part_a1}"])
+                current_col_values = [r[0] if r else "" for r in ev]
+                part_values = [r[0] if r else "" for r in parts]
+            else:
+                current_col_values = self.ws.col_values(col)
+                part_values = []
 
             write_values = self._build_status_column_values(
                 last_row, values_by_member, current_col_values
             )
+            # リアクションの無い出席扱いのメンバーは「出席」
+            for member_id, row in self._member_to_row.items():
+                if member_id in values_by_member or not (0 <= row - _DATA_START_ROW < len(write_values)):
+                    continue
+                if row - 1 < len(part_values) and self._is_default_attend(part_values[row - 1]):
+                    write_values[row - _DATA_START_ROW][0] = "出席"
 
-            col_a1 = self._col_to_a1(col)
             rng = f"{col_a1}{_DATA_START_ROW}:{col_a1}{last_row}"
             self.ws.update(values=write_values, range_name=rng)
 
@@ -1216,6 +1282,14 @@ class SheetAsyncBridge:
     ) -> bool:
         """GoogleSheetsManager.draw_part_separators を別スレッドで実行する"""
         return await asyncio.to_thread(self.gs.draw_part_separators, section_of, force)
+
+    async def default_attend_member_ids_async(self) -> set[int]:
+        """GoogleSheetsManager.default_attend_member_ids を別スレッドで実行する"""
+        return await asyncio.to_thread(self.gs.default_attend_member_ids)
+
+    async def fill_default_attend_async(self, message_id: int) -> int:
+        """GoogleSheetsManager.fill_default_attend を別スレッドで実行する"""
+        return await asyncio.to_thread(self.gs.fill_default_attend, message_id)
 
     async def is_event_hidden_async(self, message_id: int) -> bool:
         """GoogleSheetsManager.is_event_hidden を別スレッドで実行する"""
