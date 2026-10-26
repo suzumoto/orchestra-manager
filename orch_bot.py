@@ -111,6 +111,14 @@ REMINDER_SCAN_LIMIT = int(_rem_cfg.get("scan_limit", "30"))
 JOB_RETRY_HOURS = float(_rem_cfg.get("retry_hours", "5"))
 JOB_RETRY_INTERVAL_MIN = float(_rem_cfg.get("retry_interval_minutes", "5"))
 
+# 投稿本文にキーワードが含まれる練習は、リマインドの対象をそのロールの保持者に絞る
+# （例: 管分奏 = 管楽器）。[(キーワード, ロール名), ...] の順に最初に一致したものを使う
+REMINDER_TARGETS: list[tuple[str, str]] = [
+    (k.strip(), v.strip())
+    for k, v in (config["REMINDER_TARGET"].items() if "REMINDER_TARGET" in config else [])
+    if k.strip() and v.strip()
+]
+
 # ---------------- メンバー同期設定 -------------------------
 # sync_role が設定されていれば、そのロール保持者のみをシートへ登録する
 # （空なら従来どおりサーバーの全メンバーが対象）
@@ -975,10 +983,23 @@ async def _find_rsvp_posts_for_date(
     return results
 
 
+def _reminder_target_role(msg: discord.Message) -> str | None:
+    """投稿本文に REMINDER_TARGETS のキーワードがあれば、リマインド対象のロール名を返す"""
+    content = (msg.content or "").lower()
+    for keyword, role_name in REMINDER_TARGETS:
+        if keyword.lower() in content:
+            return role_name
+    return None
+
+
 async def _compute_non_responders(
-    msg: discord.Message, sheet_key: str
+    msg: discord.Message, sheet_key: str, target_role: str | None = None
 ) -> list[discord.Member]:
-    """シート登録メンバーのうち、msg に出欠リアクションをしていない人を返す"""
+    """
+    シート登録メンバーのうち、msg に出欠リアクションをしていない人を返す。
+    target_role を指定すると、そのロールの保持者だけに絞る
+    （ロールがサーバーに見つからなければ絞らずに全員を返す）。
+    """
     bridge = _bridge_for_sheet_key(sheet_key)
     registered = await bridge.registered_member_ids_async()
     reacted = set(await _collect_attendance_from_reactions(msg))
@@ -992,6 +1013,13 @@ async def _compute_non_responders(
                 continue  # 退会済み等は無視
         if not m.bot:
             members.append(m)
+
+    if target_role:
+        role = discord.utils.get(msg.guild.roles, name=target_role)
+        if role is None:
+            print(f"[reminder] ロール『{target_role}』が見つからないため、対象を絞らずに送ります (msg={msg.id})")
+        else:
+            members = [m for m in members if role in m.roles]
     return members
 
 
@@ -1055,7 +1083,8 @@ async def _send_reminder_for_post(
         print(f"[reminder] {practice_date} は列非表示（中止扱い）のためスキップ (msg={msg.id})")
         return
 
-    non_responders = await _compute_non_responders(msg, sheet_key)
+    target_role = _reminder_target_role(msg)
+    non_responders = await _compute_non_responders(msg, sheet_key, target_role)
     if not non_responders:
         print(f"[reminder] no non-responders for {practice_date} in #{msg.channel}")
         return
@@ -1069,10 +1098,11 @@ async def _send_reminder_for_post(
     role_mention = role.mention if role else f"@{REMINDER_MENTION_ROLE}"
     mentions = " ".join(m.mention for m in non_responders)
     label = "前日" if days_before == 1 else f"{days_before}日前"
+    target_note = f"（対象: {target_role}の方）" if target_role else ""
 
     content = (
         f"📢 **出欠リマインド（練習{label}）**\n"
-        f"{practice_date.month}月{practice_date.day}日の練習の出欠が未回答です。\n"
+        f"{practice_date.month}月{practice_date.day}日の練習{target_note}の出欠が未回答です。\n"
         f"こちらの投稿にリアクションで回答してください → {msg.jump_url}\n"
         f"(Cc: {role_mention})\n\n"
         f"{mentions}"
