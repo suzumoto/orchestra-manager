@@ -389,6 +389,7 @@ class GoogleSheetsManager:
         イベント列は静的な値なので置いてけぼりになる。そこで並べ替え前に
         控えたイベント列（snapshot）を行キーで対応づけ、key_order（=参照元の
         新しい行順）と同じ並びに書き直して整合を保つ。
+        参照元の列を数式で映している列（3 行目が '=' で始まる）は書き直さない。
 
         入力
         ----
@@ -432,11 +433,33 @@ class GoogleSheetsManager:
             while len(rows_out) < len(data):  # 短くなった分は空行で上書き
                 rows_out.append([""] * n_events)
 
-            rng = (
-                f"{self._col_to_a1(n_fixed + 1)}{_DATA_START_ROW}:"
-                f"{self._col_to_a1(width)}{_DATA_START_ROW + len(rows_out) - 1}"
+            # 参照元を数式でそのまま映している列（3 行目が '=' で始まる）は、
+            # 行は参照元に自動で追従するうえ、値で上書きすると数式が消えるので触らない
+            first_col = n_fixed + 1
+            formulas = self.ws.get(
+                f"{self._col_to_a1(first_col)}{_DATA_START_ROW}:"
+                f"{self._col_to_a1(width)}{_DATA_START_ROW}",
+                value_render_option="FORMULA",
             )
-            self.ws.update(values=rows_out, range_name=rng)
+            row3 = list(formulas[0] if formulas else []) + [""] * n_events
+            writable = [j for j in range(n_events) if not str(row3[j]).startswith("=")]
+
+            last_row = _DATA_START_ROW + len(rows_out) - 1
+            updates = []
+            j = 0
+            while j < len(writable):  # 連続した列ごとにまとめて書く
+                k = j
+                while k + 1 < len(writable) and writable[k + 1] == writable[k] + 1:
+                    k += 1
+                c0, c1 = writable[j], writable[k]
+                updates.append({
+                    "range": (f"{self._col_to_a1(first_col + c0)}{_DATA_START_ROW}:"
+                              f"{self._col_to_a1(first_col + c1)}{last_row}"),
+                    "values": [r[c0:c1 + 1] for r in rows_out],
+                })
+                j = k + 1
+            if updates:
+                self.ws.batch_update(updates)
             self._build_index()
             return matched
 
